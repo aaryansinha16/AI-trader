@@ -1,0 +1,24 @@
+# Core
+pandas>=2.0
+numpy>=1.24
+python-dotenv>=1.0
+
+# Database
+sqlalchemy>=2.0
+psycopg2-binary>=2.9
+
+# ML
+scikit-learn>=1.3
+xgboost>=2.0
+lightgbm>=4.0
+joblib>=1.3
+
+# Technical Analysis
+pandas-ta>=0.3.14
+
+# Broker / Data
+kiteconnect>=5.0
+websocket-client>=1.6
+
+# Logging / Utils
+colorama>=0.4
