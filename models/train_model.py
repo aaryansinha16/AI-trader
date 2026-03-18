@@ -55,14 +55,15 @@ logger = get_logger("train_model")
 
 def generate_macro_labels(
     df: pd.DataFrame,
-    forward_periods: int = 10,
-    threshold: float = 0.004,
+    forward_periods: int = 15,
+    threshold: float = 0.001,
 ) -> pd.DataFrame:
     """
     Generate labels for the Macro Model.
 
-    Default target: "Did price move +0.4% in next 10 minutes?"
-    This can be swapped to strategy-outcome labels once trade log exists.
+    Default target: "Did price move +0.1% in next 15 minutes?"
+    Tuned for ~13% positive rate to avoid extreme class imbalance.
+    Can be swapped to strategy-outcome labels once trade log exists.
 
     Args:
         df: DataFrame with 'close' column (1-minute candles with features)
@@ -87,14 +88,14 @@ def generate_macro_labels(
 
 def generate_micro_labels(
     df: pd.DataFrame,
-    forward_seconds: int = 120,
-    threshold: float = 0.002,
+    forward_seconds: int = 60,
+    threshold: float = 0.001,
 ) -> pd.DataFrame:
     """
     Generate labels for the Micro Model.
 
-    Default target: "Did price breakout (+0.2%) within next 2 minutes?"
-    Uses second-level data.
+    Default target: "Did price breakout (+0.1%) within next 60 seconds?"
+    Tuned for better class balance on tick-level data.
     """
     df = df.copy()
 
@@ -171,6 +172,7 @@ def _get_model(model_type: str = "xgboost", **kwargs):
             "eval_metric": "logloss",
             "use_label_encoder": False,
             "random_state": 42,
+            "scale_pos_weight": 1,  # overridden per-call when imbalanced
         }
         defaults.update(kwargs)
         return xgb.XGBClassifier(**defaults)
@@ -196,14 +198,22 @@ def _get_model(model_type: str = "xgboost", **kwargs):
 
 def _evaluate(model, X_test, y_test) -> Dict:
     """Evaluate a trained model and return metrics dict."""
+    from sklearn.metrics import roc_auc_score
+
     y_pred = model.predict(X_test)
     y_proba = model.predict_proba(X_test)[:, 1]
+
+    try:
+        auc = round(roc_auc_score(y_test, y_proba), 4)
+    except ValueError:
+        auc = 0.0
 
     metrics = {
         "accuracy": round(accuracy_score(y_test, y_pred), 4),
         "precision": round(precision_score(y_test, y_pred, zero_division=0), 4),
         "recall": round(recall_score(y_test, y_pred, zero_division=0), 4),
         "f1": round(f1_score(y_test, y_pred, zero_division=0), 4),
+        "auc_roc": auc,
     }
     return metrics
 
@@ -223,17 +233,25 @@ class MacroModelTrainer:
     def prepare_data(
         self,
         features_df: pd.DataFrame,
-        forward_periods: int = 10,
-        threshold: float = 0.004,
+        forward_periods: int = 15,
+        threshold: float = 0.001,
     ) -> pd.DataFrame:
         """Add labels and drop rows with NaN features."""
         df = generate_macro_labels(features_df, forward_periods, threshold)
 
         available = [c for c in self.feature_cols if c in df.columns]
-        self.feature_cols = available
 
-        df = df.dropna(subset=available + ["target"])
-        logger.info(f"Prepared {len(df)} samples with {len(available)} features.")
+        # Drop features that are entirely NaN (e.g. options features for index)
+        non_null = [c for c in available if df[c].notna().any()]
+        dropped = set(available) - set(non_null)
+        if dropped:
+            logger.info(f"Dropping all-NaN features: {dropped}")
+        self.feature_cols = non_null
+
+        # Fill remaining sporadic NaNs (e.g. first few rows for rolling indicators)
+        df[non_null] = df[non_null].ffill().bfill()
+        df = df.dropna(subset=non_null + ["target"])
+        logger.info(f"Prepared {len(df)} samples with {len(non_null)} features.")
         return df
 
     def train(
@@ -253,6 +271,13 @@ class MacroModelTrainer:
         """
         X = df[self.feature_cols]
         y = df["target"]
+
+        # Auto-compute class weight for imbalanced data
+        neg_count = (y == 0).sum()
+        pos_count = (y == 1).sum()
+        if pos_count > 0 and "scale_pos_weight" not in model_kwargs:
+            model_kwargs["scale_pos_weight"] = round(neg_count / pos_count, 2)
+            logger.info(f"Auto scale_pos_weight={model_kwargs['scale_pos_weight']} (neg/pos={neg_count}/{pos_count})")
 
         if walk_forward:
             logger.info(f"Walk-forward validation with {n_splits} splits...")
@@ -288,6 +313,61 @@ class MacroModelTrainer:
 
         return self.metrics
 
+    def incremental_train(
+        self,
+        new_df: pd.DataFrame,
+        existing_model_path: str = None,
+        **model_kwargs,
+    ) -> Dict:
+        """
+        Incremental (warm-start) training for daily macro model updates.
+        Loads existing model and continues boosting on new day's data.
+
+        Args:
+            new_df: new day's feature data (already prepared with labels)
+            existing_model_path: path to existing .pkl model file
+        """
+        existing_path = existing_model_path or MACRO_MODEL_PATH
+
+        try:
+            existing_data = joblib.load(existing_path)
+            self.model = existing_data["model"]
+            self.feature_cols = existing_data.get("features", self.feature_cols)
+            logger.info(f"Loaded existing macro model from {existing_path}")
+        except (FileNotFoundError, Exception) as e:
+            logger.warning(f"No existing model ({e}). Training from scratch.")
+            return self.train(new_df, walk_forward=False, **model_kwargs)
+
+        X_new = new_df[self.feature_cols]
+        y_new = new_df["target"]
+
+        if len(X_new) < 10:
+            logger.warning(f"Only {len(X_new)} new samples. Skipping incremental train.")
+            return self.metrics
+
+        try:
+            if self.model_type == "xgboost":
+                new_model = _get_model(self.model_type, n_estimators=50, **model_kwargs)
+                new_model.fit(X_new, y_new, xgb_model=self.model.get_booster())
+                self.model = new_model
+            elif self.model_type == "lightgbm":
+                new_model = _get_model(self.model_type, n_estimators=50, **model_kwargs)
+                new_model.fit(X_new, y_new, init_model=self.model)
+                self.model = new_model
+            else:
+                self.model = _get_model(self.model_type, **model_kwargs)
+                self.model.fit(X_new, y_new)
+
+            self.metrics = _evaluate(self.model, X_new, y_new)
+            logger.info(
+                f"Macro incremental training on {len(X_new)} samples. "
+                f"Metrics: {self.metrics}"
+            )
+        except Exception as e:
+            logger.error(f"Macro incremental training failed: {e}. Keeping existing model.")
+
+        return self.metrics
+
     def save(self, path: str = None):
         """Save trained model to disk."""
         path = path or MACRO_MODEL_PATH
@@ -315,6 +395,7 @@ class MicroModelTrainer:
     """
     Trains the Microstructure Model on tick/second-level features.
     Uses walk-forward validation.
+    Supports incremental (warm-start) training for daily updates.
     """
 
     def __init__(self, model_type: str = "xgboost"):
@@ -326,17 +407,22 @@ class MicroModelTrainer:
     def prepare_data(
         self,
         features_df: pd.DataFrame,
-        forward_seconds: int = 120,
-        threshold: float = 0.002,
+        forward_seconds: int = 60,
+        threshold: float = 0.001,
     ) -> pd.DataFrame:
         """Add labels and drop NaN rows."""
         df = generate_micro_labels(features_df, forward_seconds, threshold)
 
         available = [c for c in self.feature_cols if c in df.columns]
-        self.feature_cols = available
+        non_null = [c for c in available if df[c].notna().any()]
+        dropped = set(available) - set(non_null)
+        if dropped:
+            logger.info(f"Dropping all-NaN micro features: {dropped}")
+        self.feature_cols = non_null
 
-        df = df.dropna(subset=available + ["target"])
-        logger.info(f"Prepared {len(df)} micro samples with {len(available)} features.")
+        df[non_null] = df[non_null].ffill().bfill()
+        df = df.dropna(subset=non_null + ["target"])
+        logger.info(f"Prepared {len(df)} micro samples with {len(non_null)} features.")
         return df
 
     def train(
@@ -349,6 +435,13 @@ class MicroModelTrainer:
         """Train the micro model with optional walk-forward validation."""
         X = df[self.feature_cols]
         y = df["target"]
+
+        # Auto-compute class weight for imbalanced data
+        neg_count = (y == 0).sum()
+        pos_count = (y == 1).sum()
+        if pos_count > 0 and "scale_pos_weight" not in model_kwargs:
+            model_kwargs["scale_pos_weight"] = round(neg_count / pos_count, 2)
+            logger.info(f"Micro auto scale_pos_weight={model_kwargs['scale_pos_weight']}")
 
         if walk_forward:
             logger.info(f"Micro walk-forward with {n_splits} splits...")
@@ -379,6 +472,69 @@ class MicroModelTrainer:
 
         if not walk_forward:
             self.metrics = _evaluate(self.model, X, y)
+
+        return self.metrics
+
+    def incremental_train(
+        self,
+        new_df: pd.DataFrame,
+        existing_model_path: str = None,
+        **model_kwargs,
+    ) -> Dict:
+        """
+        Incremental (warm-start) training: load existing model and continue
+        training on new data. This avoids retraining from scratch daily.
+
+        For XGBoost: uses xgb_model parameter to continue boosting.
+        For LightGBM: uses init_model parameter.
+
+        Args:
+            new_df: new day's data (already prepared with labels)
+            existing_model_path: path to existing .pkl model file
+        """
+        existing_path = existing_model_path or MICRO_MODEL_PATH
+
+        # Load existing model
+        existing_data = None
+        try:
+            existing_data = joblib.load(existing_path)
+            self.model = existing_data["model"]
+            self.feature_cols = existing_data.get("features", self.feature_cols)
+            logger.info(f"Loaded existing micro model from {existing_path}")
+        except (FileNotFoundError, Exception) as e:
+            logger.warning(f"No existing model found ({e}). Training from scratch.")
+            return self.train(new_df, walk_forward=False, **model_kwargs)
+
+        X_new = new_df[self.feature_cols]
+        y_new = new_df["target"]
+
+        if len(X_new) < 10:
+            logger.warning(f"Only {len(X_new)} new samples. Skipping incremental train.")
+            return self.metrics
+
+        try:
+            if self.model_type == "xgboost":
+                # XGBoost warm-start: pass existing booster
+                new_model = _get_model(self.model_type, n_estimators=50, **model_kwargs)
+                new_model.fit(X_new, y_new, xgb_model=self.model.get_booster())
+                self.model = new_model
+            elif self.model_type == "lightgbm":
+                # LightGBM warm-start: pass init_model
+                new_model = _get_model(self.model_type, n_estimators=50, **model_kwargs)
+                new_model.fit(X_new, y_new, init_model=self.model)
+                self.model = new_model
+            else:
+                # Fallback: retrain from scratch
+                self.model = _get_model(self.model_type, **model_kwargs)
+                self.model.fit(X_new, y_new)
+
+            self.metrics = _evaluate(self.model, X_new, y_new)
+            logger.info(
+                f"Incremental training complete on {len(X_new)} new samples. "
+                f"Metrics: {self.metrics}"
+            )
+        except Exception as e:
+            logger.error(f"Incremental training failed: {e}. Keeping existing model.")
 
         return self.metrics
 

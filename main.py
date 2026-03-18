@@ -90,12 +90,22 @@ def run_ingest():
     """
     Load historical data from TrueData into the database and build features.
     Requires: TimescaleDB running + TrueData credentials in .env
+
+    Pipeline:
+      1. Authenticate with TrueData REST API
+      2. Load F&O symbol master (all strikes, expiries)
+      3. Fetch 6 months of 1m index bars (NIFTY-I, BANKNIFTY-I)
+      4. For each underlying: resolve dynamic ATM strikes per historical timestamp
+      5. Fetch tick data (5 days) for option symbols
+      6. Store in TimescaleDB and build features
     """
     from database.db import init_db
     from data.truedata_adapter import TrueDataAdapter
+    from data.symbol_manager import SymbolManager
     from data.aggregator import AggregationEngine
     from data.tick_collector import TickCollector
     from features.feature_engine import build_all_features
+    from config.settings import TD_INDEX_SYMBOLS, STRIKE_GAP
 
     logger.info("=" * 60)
     logger.info("MODE: INGEST – loading historical data from TrueData")
@@ -104,37 +114,87 @@ def run_ingest():
     # 1. Initialize database
     init_db()
 
-    # 2. Connect to TrueData
+    # 2. Authenticate with TrueData REST API
     td = TrueDataAdapter()
-    td.connect()
-
-    if not td.is_connected:
+    if not td.authenticate():
         logger.error(
-            "Cannot connect to TrueData. "
-            "Check credentials in .env or run 'python main.py mock' instead."
+            "Cannot authenticate with TrueData. "
+            "Check TRUEDATA_USER / TRUEDATA_PASSWORD in .env"
         )
         return
+
+    # 3. Load symbol master (all F&O symbols with expiry, strike, etc.)
+    sym_mgr = SymbolManager()
+    master = sym_mgr.load_symbol_master(segment="fo")
+    if master.empty:
+        logger.warning("Symbol master empty. Will construct symbol names dynamically.")
+
+    logger.info(sym_mgr.summary())
 
     agg = AggregationEngine()
     collector = TickCollector()
 
-    for symbol in SYMBOLS:
-        # 3a. Fetch 6 months of 1m bars → Macro Model training data
-        minute_df = td.fetch_historical_minute_bars(symbol, days=180)
+    for underlying in SYMBOLS:
+        index_sym = TD_INDEX_SYMBOLS.get(underlying, underlying)
+
+        # 4a. Fetch 6 months of 1m bars for INDEX (NIFTY-I / BANKNIFTY-I)
+        logger.info(f"\n{'='*40}")
+        logger.info(f"Ingesting {underlying} (index: {index_sym})")
+        logger.info(f"{'='*40}")
+
+        minute_df = td.fetch_historical_minute_bars(index_sym, days=180)
         if not minute_df.empty:
             agg.ingest_minute_bars(minute_df)
+            logger.info(f"  {underlying} index: {len(minute_df)} minute bars stored.")
+        else:
+            logger.warning(f"  No minute bars returned for {index_sym}.")
+            continue
 
-        # 3b. Fetch 5 days of tick data → Micro Model training data
-        tick_df = td.fetch_historical_ticks(symbol, days=5)
+        # 4b. Fetch tick data for INDEX (5 days)
+        tick_df = td.fetch_historical_ticks(index_sym, days=5)
         if not tick_df.empty:
             collector.ingest_historical_ticks(tick_df)
-            agg.aggregate_from_db(symbol)
+            logger.info(f"  {underlying} index: {len(tick_df)} ticks stored.")
 
-        # 4. Build features
-        build_all_features(symbol)
+        # 4c. Fetch option data for ATM ±3 strikes (nearest expiry)
+        nearest_expiry = sym_mgr.get_nearest_expiry(underlying)
+        if nearest_expiry:
+            # Get current ATM from latest spot price
+            latest_close = minute_df.iloc[-1]["close"] if not minute_df.empty else 0
+            option_syms = sym_mgr.get_option_symbols(
+                underlying, latest_close, expiry=nearest_expiry
+            )
+            logger.info(
+                f"  {underlying} options: {len(option_syms)} contracts "
+                f"(ATM={sym_mgr.compute_atm(latest_close, STRIKE_GAP.get(underlying, 50))}, "
+                f"expiry={nearest_expiry})"
+            )
+
+            for opt in option_syms:
+                # Fetch 1m bars for each option symbol
+                opt_bars = td.fetch_historical_minute_bars(opt.symbol, days=30)
+                if not opt_bars.empty:
+                    agg.ingest_minute_bars(opt_bars)
+
+                # Fetch tick data for each option symbol (5 days)
+                opt_ticks = td.fetch_historical_ticks(opt.symbol, days=5)
+                if not opt_ticks.empty:
+                    collector.ingest_historical_ticks(opt_ticks)
+
+                logger.info(
+                    f"    {opt.symbol} (rel={opt.relative_strike:+d}): "
+                    f"{len(opt_bars)} bars, {len(opt_ticks)} ticks"
+                )
+        else:
+            logger.warning(f"  No expiry found for {underlying}. Skipping options.")
+
+        # 5. Build features from stored data
+        build_all_features(underlying)
 
     td.disconnect()
+    logger.info("\n" + "=" * 60)
     logger.info("Historical data ingestion complete.")
+    logger.info("=" * 60)
 
 
 def run_train():
@@ -176,10 +236,12 @@ def run_backtest():
 
     This demonstrates the entire system end-to-end without needing real data or DB.
     No ML models are trained on mock data - uses default 0.5 probability.
+    Results are automatically exported to backtest_results/ directory.
     """
     from data.mock_data import generate_mock_minute_bars
     from features.indicators import compute_all_macro_indicators
     from backtest.backtest_engine import BacktestEngine
+    from datetime import datetime
 
     logger.info("=" * 60)
     logger.info("MODE: BACKTEST - running strategy backtest on mock data")
@@ -187,6 +249,7 @@ def run_backtest():
     logger.info("NOTE: ML probability fixed at 0.5 (no model trained on mock data)")
 
     engine = BacktestEngine()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     for symbol in SYMBOLS:
         logger.info(f"\nBacktesting {symbol}...")
@@ -203,7 +266,70 @@ def run_backtest():
         logger.info(f"{symbol} backtest: {result.total_trades} trades, "
                      f"win_rate={result.win_rate:.1%}, PnL={result.gross_pnl:,.0f}")
 
-    logger.info("Backtest complete.")
+        # Export results to files
+        base_name = f"{symbol}_{timestamp}"
+        result.export_all(base_name=base_name, output_dir="backtest_results")
+
+    logger.info("\nBacktest complete. Results exported to backtest_results/ directory.")
+
+
+def run_backtest_real():
+    """
+    Run backtest on REAL historical data from TimescaleDB with trained ML model.
+
+    Pipeline:
+      DB minute candles → Option chain enrichment → Feature computation
+      → Strategy signals → ML scoring via Predictor → SL/Target sim → Metrics
+
+    Requires: TimescaleDB with data + trained ML models.
+    Results exported to backtest_results/ directory.
+    """
+    from features.feature_engine import build_macro_features
+    from models.predict import Predictor
+    from backtest.backtest_engine import BacktestEngine
+    from config.settings import TD_INDEX_SYMBOLS
+    from datetime import datetime
+
+    logger.info("=" * 60)
+    logger.info("MODE: BACKTEST-REAL - backtesting on historical DB data with ML")
+    logger.info("=" * 60)
+
+    # Load trained ML model
+    predictor = Predictor()
+    predictor.load()
+    if predictor.is_loaded:
+        logger.info("ML Predictor loaded — using trained model for scoring.")
+    else:
+        logger.warning("No ML model found. Using default 0.5 probability.")
+        predictor = None
+
+    engine = BacktestEngine()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    for symbol in SYMBOLS:
+        index_sym = TD_INDEX_SYMBOLS.get(symbol, symbol)
+        logger.info(f"\nBacktesting {symbol} (index: {index_sym}) on real data...")
+
+        # Build features from DB (includes option chain enrichment)
+        featured_df = build_macro_features(index_sym)
+
+        if featured_df.empty:
+            logger.warning(f"No data for {index_sym}. Run 'ingest' first.")
+            continue
+
+        logger.info(f"  Features: {featured_df.shape[0]} rows, {featured_df.shape[1]} cols")
+
+        # Run backtest with trained ML model
+        result = engine.run(featured_df, symbol=index_sym, predictor=predictor)
+
+        logger.info(f"  {symbol} backtest: {result.total_trades} trades, "
+                     f"win_rate={result.win_rate:.1%}, PnL=₹{result.gross_pnl:,.0f}")
+
+        # Export results
+        base_name = f"{symbol}_real_{timestamp}"
+        result.export_all(base_name=base_name, output_dir="backtest_results")
+
+    logger.info("\nReal-data backtest complete. Results in backtest_results/")
 
 
 def run_live():
@@ -364,6 +490,7 @@ def main():
         "ingest": run_ingest,
         "train": run_train,
         "backtest": run_backtest,
+        "backtest-real": run_backtest_real,
         "live": run_live,
     }
 

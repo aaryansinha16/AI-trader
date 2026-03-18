@@ -1,13 +1,27 @@
+# Environment
 .env
+
+# Python
 __pycache__/
 *.pyc
 *.pyo
-*.pkl
-models/saved/
-logs/
-.DS_Store
 *.egg-info/
 dist/
 build/
 .venv/
 venv/
+
+# ML Models (binary, regeneratable)
+*.pkl
+models/saved/
+
+# Market Data (TrueData compliance — do NOT upload to GitHub)
+data/historical/
+TD_API_Documents/
+
+# Logs and Results
+logs/
+backtest_results/
+
+# OS
+.DS_Store

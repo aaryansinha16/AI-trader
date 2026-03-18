@@ -187,6 +187,11 @@ python main.py backtest
 ```
 Runs full strategy backtest on mock data. Tests signal generation, scoring, and SL/target simulation.
 
+**Results are automatically exported to `backtest_results/` directory in 3 formats:**
+- **CSV** (`*_trades.csv`): All trades with entry/exit prices, P&L, scores - open in Excel
+- **JSON** (`*_results.json`): Full results including summary metrics and trade details - for programmatic analysis
+- **TXT** (`*_report.txt`): Human-readable formatted report with summary and trade-by-trade breakdown
+
 #### 5. Live Mode (Production Trading)
 ```bash
 python main.py live

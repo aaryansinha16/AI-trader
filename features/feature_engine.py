@@ -29,11 +29,16 @@ def build_macro_features(
     symbol: str,
     option_chain_df: Optional[pd.DataFrame] = None,
     limit: int = 0,
+    enrich_options: bool = True,
 ) -> pd.DataFrame:
     """
     Build macro feature set from 1-minute candles.
     Reads from minute_candles table, computes all indicators,
     writes to features_macro table, and returns the DataFrame.
+
+    If enrich_options=True and no option_chain_df is provided,
+    automatically builds a time-aligned option chain from the DB
+    and merges PCR, OI change, OI skew, etc. into the index data.
     """
     query = (
         "SELECT * FROM minute_candles "
@@ -50,13 +55,24 @@ def build_macro_features(
 
     df["timestamp"] = pd.to_datetime(df["timestamp"])
 
+    # Auto-enrich with option chain data if available
+    if option_chain_df is None and enrich_options:
+        try:
+            from features.option_chain_builder import enrich_index_with_options
+            df = enrich_index_with_options(df)
+            logger.info(f"Enriched index with option chain features.")
+        except Exception as e:
+            logger.warning(f"Option chain enrichment failed: {e}")
+
     # Compute all macro indicators
     df = compute_all_macro_indicators(df, option_chain_df)
 
-    # Select feature columns that exist
-    available_cols = ["timestamp", "symbol"] + [
+    # Select feature columns + OHLCV (needed for backtest SL/target simulation)
+    ohlcv_cols = ["timestamp", "symbol", "open", "high", "low", "close", "volume", "vwap"]
+    available_cols = ohlcv_cols + [
         c for c in FEATURE_COLUMNS_MACRO if c in df.columns
     ]
+    available_cols = list(dict.fromkeys(c for c in available_cols if c in df.columns))
     features_df = df[available_cols].copy()
 
     # Persist to DB
@@ -97,10 +113,11 @@ def build_micro_features(
     if features_df.empty:
         return features_df
 
-    # Persist to DB
-    available_cols = ["timestamp", "symbol"] + [
+    # Persist to DB (include 'price' for label generation downstream)
+    available_cols = ["timestamp", "symbol", "price"] + [
         c for c in FEATURE_COLUMNS_MICRO if c in features_df.columns
     ]
+    available_cols = [c for c in available_cols if c in features_df.columns]
     out = features_df[available_cols].copy()
 
     try:

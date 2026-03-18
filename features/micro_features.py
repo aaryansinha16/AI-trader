@@ -105,6 +105,7 @@ def compute_micro_features(
 
     result = agg[[
         "symbol",
+        "price",
         "bid_ask_spread",
         "order_imbalance",
         "trade_size_spike",

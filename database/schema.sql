@@ -6,7 +6,33 @@
 
 CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;
 
--- ── Tick Data (raw ticks from Kite / TrueData WebSocket) ─────────────────────
+-- ── Symbol Master (TrueData F&O universe, refreshed daily) ───────────────────
+CREATE TABLE IF NOT EXISTS symbol_master (
+    symbol          TEXT            NOT NULL,
+    symbol_id       BIGINT,
+    underlying      TEXT            NOT NULL,  -- NIFTY / BANKNIFTY
+    expiry          DATE            NOT NULL,
+    strike          DOUBLE PRECISION NOT NULL,
+    option_type     TEXT            NOT NULL,  -- CE / PE
+    segment         TEXT            NOT NULL DEFAULT 'fo',
+    lot_size        INT,
+    tick_size       DOUBLE PRECISION,
+    updated_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (symbol)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sm_underlying_expiry
+    ON symbol_master (underlying, expiry, strike);
+
+-- ── Auth Token Cache ─────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS auth_tokens (
+    provider        TEXT            PRIMARY KEY,
+    token           TEXT            NOT NULL,
+    expires_at      TIMESTAMPTZ     NOT NULL,
+    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+);
+
+-- ── Tick Data (raw ticks from TrueData TCP / Kite WebSocket) ─────────────────
 CREATE TABLE IF NOT EXISTS tick_data (
     timestamp   TIMESTAMPTZ     NOT NULL,
     symbol      TEXT            NOT NULL,
@@ -16,7 +42,11 @@ CREATE TABLE IF NOT EXISTS tick_data (
     ask_price   DOUBLE PRECISION,
     bid_qty     BIGINT,
     ask_qty     BIGINT,
-    oi          BIGINT
+    oi          BIGINT,
+    atp         DOUBLE PRECISION,       -- average traded price (from TrueData)
+    total_volume BIGINT,                -- cumulative day volume
+    prev_oi     BIGINT,
+    turnover    DOUBLE PRECISION
 );
 
 SELECT create_hypertable('tick_data', 'timestamp', if_not_exists => TRUE);
@@ -47,7 +77,8 @@ CREATE TABLE IF NOT EXISTS minute_candles (
     low         DOUBLE PRECISION NOT NULL,
     close       DOUBLE PRECISION NOT NULL,
     volume      BIGINT          NOT NULL DEFAULT 0,
-    vwap        DOUBLE PRECISION
+    vwap        DOUBLE PRECISION,
+    oi          BIGINT          DEFAULT 0
 );
 
 SELECT create_hypertable('minute_candles', 'timestamp', if_not_exists => TRUE);
@@ -74,9 +105,11 @@ CREATE INDEX IF NOT EXISTS idx_5min_symbol_ts ON five_minute_candles (symbol, ti
 CREATE TABLE IF NOT EXISTS option_chain (
     timestamp       TIMESTAMPTZ     NOT NULL,
     symbol          TEXT            NOT NULL,
+    underlying      TEXT            NOT NULL,  -- NIFTY / BANKNIFTY
     expiry          DATE            NOT NULL,
     strike          DOUBLE PRECISION NOT NULL,
     option_type     TEXT            NOT NULL,  -- CE / PE
+    relative_strike INT,                       -- 0=ATM, +1=ATM+1, -1=ATM-1, etc.
     ltp             DOUBLE PRECISION,
     volume          BIGINT          DEFAULT 0,
     oi              BIGINT          DEFAULT 0,
@@ -175,6 +208,22 @@ CREATE TABLE IF NOT EXISTS model_registry (
     is_active       BOOLEAN         DEFAULT FALSE,
     metadata        JSONB
 );
+
+-- ── Model Predictions (for accuracy monitoring / concept drift) ─────────────
+CREATE TABLE IF NOT EXISTS model_predictions (
+    id              SERIAL          PRIMARY KEY,
+    timestamp       TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    symbol          TEXT            NOT NULL,
+    model_type      TEXT            NOT NULL,  -- macro / micro
+    predicted_prob  DOUBLE PRECISION NOT NULL,
+    predicted_class INT             NOT NULL,  -- 1 or 0
+    actual_outcome  INT,                       -- filled after trade resolves
+    correct         BOOLEAN,
+    trade_id        INT
+);
+
+CREATE INDEX IF NOT EXISTS idx_mp_date_model
+    ON model_predictions (timestamp DESC, model_type);
 
 -- ── Daily Performance ────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS daily_performance (
