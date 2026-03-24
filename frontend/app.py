@@ -1443,9 +1443,10 @@ def api_system_stop():
 def api_backtest_results():
     """Load saved backtest CSV results for all risk profiles."""
     import glob
+    _project_root = Path(__file__).resolve().parent.parent
     results = {}
     for risk in ["low", "medium", "high"]:
-        path = f"backtest_results/trades_{risk}_risk.csv"
+        path = str(_project_root / "backtest_results" / f"trades_{risk}_risk.csv")
         if os.path.exists(path):
             try:
                 df = pd.read_csv(path)
@@ -1482,7 +1483,8 @@ def api_backtest_results():
 def api_trade_history():
     """All completed trades from latest backtest run."""
     risk = request.args.get("risk", "medium")
-    path = f"backtest_results/trades_{risk}_risk.csv"
+    _project_root = Path(__file__).resolve().parent.parent
+    path = str(_project_root / "backtest_results" / f"trades_{risk}_risk.csv")
     if not os.path.exists(path):
         return jsonify([])
     try:
@@ -1495,9 +1497,10 @@ def api_trade_history():
 @app.route("/api/equity/curve")
 def api_equity_curve():
     """Return equity curves for all three risk profiles."""
+    _project_root = Path(__file__).resolve().parent.parent
     curves = {}
     for risk in ["low", "medium", "high"]:
-        path = f"backtest_results/trades_{risk}_risk.csv"
+        path = str(_project_root / "backtest_results" / f"trades_{risk}_risk.csv")
         if os.path.exists(path):
             try:
                 df = pd.read_csv(path)
@@ -1602,8 +1605,26 @@ def api_backtest_run():
         date_args: list = []
         if start_date:
             from datetime import timedelta as _td
-            sd = datetime.strptime(start_date, "%Y-%m-%d").date()
-            ed = datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else date.today()
+            from email.utils import parsedate_to_datetime as _parse_rfc2822
+
+            def _parse_date(s):
+                """Parse YYYY-MM-DD or RFC 2822 date string to date object."""
+                if not s:
+                    return date.today()
+                s = s.strip()
+                # Try YYYY-MM-DD first (most common)
+                if len(s) == 10 and s[4] == '-':
+                    return datetime.strptime(s, "%Y-%m-%d").date()
+                # Try RFC 2822 (e.g. 'Tue, 10 Mar 2026 00:00:00 GMT')
+                try:
+                    return _parse_rfc2822(s).date()
+                except Exception:
+                    pass
+                # Try ISO format as fallback
+                return datetime.fromisoformat(s.replace("Z", "+00:00")).date()
+
+            sd = _parse_date(start_date)
+            ed = _parse_date(end_date) if end_date else date.today()
             d = sd
             while d <= ed:
                 if d.weekday() < 5:  # skip weekends
@@ -1911,12 +1932,15 @@ if __name__ == "__main__":
     _ensure_tick_monitor()
     _ensure_collector()
 
+    _default_port = 5050
+    port = int(os.environ.get("PORT") or _default_port)
+
     print("\n" + "=" * 50)
     print("  AI Trader Paper Trading Dashboard")
-    print("  Flask API: http://localhost:5050")
+    print(f"  Flask API: http://localhost:{port}")
     print("  Next.js UI: http://localhost:3000")
-    print("  SSE Stream: http://localhost:5050/api/stream")
+    print(f"  SSE Stream: http://localhost:{port}/api/stream")
     print("  Press Ctrl+C to stop")
     print("=" * 50 + "\n")
 
-    app.run(host="0.0.0.0", port=5050, debug=False, threaded=True)
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)

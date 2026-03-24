@@ -9,6 +9,7 @@ import {
 } from "lucide-react";
 import { fetchJSON, postJSON, type LiveState } from "@/lib/api";
 import { useTradingMode } from "@/contexts/TradingModeContext";
+import { useFullscreenPnl } from "@/app/providers";
 
 const nav = [
   { href: "/",         label: "DASHBOARD",   icon: LayoutDashboard },
@@ -20,12 +21,13 @@ const nav = [
   { href: "/settings", label: "SETTINGS",     icon: Settings },
 ];
 
-export default function Sidebar({ onFullscreenPnl }: { onFullscreenPnl?: () => void }) {
+export default function Sidebar() {
   const pathname = usePathname();
   const [status, setStatus] = useState<string>("connecting");
   const [enabled, setEnabled] = useState<boolean>(true);
   const [toggling, setToggling] = useState(false);
   const { mode, setMode } = useTradingMode();
+  const { show: onFullscreenPnl } = useFullscreenPnl();
 
   useEffect(() => {
     const poll = () => {
@@ -90,16 +92,14 @@ export default function Sidebar({ onFullscreenPnl }: { onFullscreenPnl?: () => v
         })}
 
         {/* Full P&L shortcut */}
-        {onFullscreenPnl && (
-          <button
-            onClick={onFullscreenPnl}
-            className="flex items-center gap-3 px-3 py-[7px] text-[11px] font-medium tracking-wide w-full text-left mt-4 transition-all"
-            style={{ color: '#e8c300', borderLeft: '2px solid transparent' }}
-          >
-            <Maximize2 className="w-3.5 h-3.5 flex-shrink-0" />
-            FULL P&L [Ctrl+K]
-          </button>
-        )}
+        <button
+          onClick={onFullscreenPnl}
+          className="flex items-center gap-3 px-3 py-[7px] text-[11px] font-medium tracking-wide w-full text-left mt-4 transition-all"
+          style={{ color: '#e8c300', borderLeft: '2px solid transparent' }}
+        >
+          <Maximize2 className="w-3.5 h-3.5 flex-shrink-0" />
+          FULL P&L [Ctrl+K]
+        </button>
       </nav>
 
       {/* Mode toggle */}

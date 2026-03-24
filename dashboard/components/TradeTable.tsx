@@ -2,6 +2,7 @@
 
 import Badge from "./Badge";
 import type { Trade } from "@/lib/api";
+import { toDateStr, toISTTimeFull } from "@/lib/time";
 
 interface Props {
   trades: Trade[];
@@ -32,7 +33,7 @@ export default function TradeTable({ trades, maxRows }: Props) {
       <table>
         <thead>
           <tr>
-            {["Time", "Symbol", "Dir", "Strategy", "Entry", "Exit", "P&L", "Result", "Score", "Regime"].map(h => (
+            {["Date", "Time", "Symbol", "Dir", "Strategy", "Entry", "Exit", "P&L", "Result", "Score", "Regime"].map(h => (
               <th key={h}>{h}</th>
             ))}
           </tr>
@@ -41,7 +42,10 @@ export default function TradeTable({ trades, maxRows }: Props) {
           {rows.map((t, i) => (
             <tr key={i}>
               <td style={{ color: '#5a6270' }}>
-                {String(t.entry_time).substring(11, 19) || String(t.entry_time).substring(0, 10)}
+                {toDateStr(String(t.entry_time))}
+              </td>
+              <td style={{ color: '#5a6270' }}>
+                {toISTTimeFull(String(t.entry_time))}
               </td>
               <td style={{ color: '#c8cdd5' }}>{t.symbol}</td>
               <td>

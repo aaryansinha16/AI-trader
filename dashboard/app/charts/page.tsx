@@ -16,6 +16,7 @@ import {
   ResponsiveContainer, ReferenceLine, Area,
 } from "recharts";
 import RetroCalendar from "@/components/RetroCalendar";
+import { toISTTime as toIST_HM, toISTTimeFull as toIST_HMS } from "@/lib/time";
 
 /* ── helpers ─────────────────────────────────────────────────────────── */
 
@@ -39,7 +40,7 @@ function NiftyCandleChart({ candles }: { candles: Candle[] }) {
     return <div className="h-64 flex items-center justify-center text-[11px]" style={{ color: '#3d4450' }}>NO CANDLE DATA</div>;
 
   const data = candles.map(c => ({
-    t: String(c.timestamp).substring(11, 16),
+    t: toIST_HM(String(c.timestamp)),
     open: c.open, high: c.high, low: c.low, close: c.close,
     vol: c.volume,
   }));
@@ -71,7 +72,7 @@ function OptionTickChart({ tickData, symbol }: { tickData: OptionTickData; symbo
 
   const isTick = tickData.source === "ticks";
   const data = tickData.data.map((d: Record<string, unknown>) => ({
-    t:   String(d.timestamp ?? "").substring(11, 19),
+    t:   toIST_HMS(String(d.timestamp ?? "")),
     ltp: Number(isTick ? d.price : d.close) || 0,
     vol: Number(d.volume) || 0,
     oi:  Number(d.oi) || 0,
@@ -427,7 +428,7 @@ export default function ChartsPage() {
             <ResponsiveContainer width="100%" height={300}>
               <ComposedChart data={ticks.filter((_, i) => i % Math.max(1, Math.floor(ticks.length / 2000)) === 0)} margin={{ top: 5, right: 5, bottom: 5, left: 5 }}>
                 <CartesianGrid stroke="#1e222c" strokeDasharray="3 3" />
-                <XAxis dataKey="timestamp" tick={{ fontSize: 9, fill: "#3d4450" }} tickFormatter={t => t?.slice(11, 19)} />
+                <XAxis dataKey="timestamp" tick={{ fontSize: 9, fill: "#3d4450" }} tickFormatter={t => toIST_HMS(t ?? "")} />
                 <YAxis domain={["auto", "auto"]} tick={{ fontSize: 9, fill: "#5a6270" }} />
                 <Tooltip contentStyle={TIP} labelStyle={{ fontSize: 9 }} itemStyle={{ fontSize: 10 }} />
                 <Line type="monotone" dataKey="price" stroke="#00e87b" strokeWidth={1} dot={false} name="Price" />

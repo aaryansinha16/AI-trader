@@ -6,7 +6,6 @@ import StatCard from "@/components/StatCard";
 import EquityChart from "@/components/EquityChart";
 import TradeTable from "@/components/TradeTable";
 import PnlBarChart from "@/components/PnlBarChart";
-import FullscreenPnl from "@/components/FullscreenPnl";
 import { fetchJSON, type BacktestResults, type LiveState, type EquityCurvePoint } from "@/lib/api";
 import { RefreshCw } from "lucide-react";
 
@@ -14,26 +13,12 @@ const pnlFmt = (v: number) =>
   `₹${v >= 0 ? "+" : ""}${v.toLocaleString("en-IN", { maximumFractionDigits: 0 })}`;
 
 export default function Home() {
-  const [showFullPnl, setShowFullPnl] = useState(false);
   const [live, setLive] = useState<LiveState | null>(null);
   const [results, setResults] = useState<BacktestResults>({});
   const [curves, setCurves] = useState<Record<string, EquityCurvePoint[]>>({});
   const [activeRisk, setActiveRisk] = useState<"low" | "medium" | "high">("high");
   const [loading, setLoading] = useState(true);
   const [lastRefresh, setLastRefresh] = useState<string>("--");
-
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      // Cmd+Shift+F (Mac) or Ctrl+Shift+F (Windows/Linux)
-      if (e.ctrlKey && e.key === "k") {
-        e.preventDefault();
-        setShowFullPnl(p => !p);
-      }
-      if (e.key === "Escape") setShowFullPnl(false);
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, []);
 
   const load = useCallback(async () => {
     try {
@@ -63,8 +48,7 @@ export default function Home() {
 
   return (
     <div className="flex min-h-screen">
-      {showFullPnl && <FullscreenPnl onClose={() => setShowFullPnl(false)} />}
-      <Sidebar onFullscreenPnl={() => setShowFullPnl(true)} />
+      <Sidebar />
 
       <div className="flex-1 flex flex-col min-h-screen overflow-hidden">
         {/* ── Ticker Bar (top) ─────────────────────────────────── */}

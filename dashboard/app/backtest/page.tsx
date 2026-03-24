@@ -4,6 +4,7 @@ import { useEffect, useState, useCallback, useRef } from "react";
 import Sidebar from "@/components/Sidebar";
 import EquityChart from "@/components/EquityChart";
 import RiskProfileCard from "@/components/RiskProfileCard";
+import TradeTable from "@/components/TradeTable";
 import { fetchJSON, postJSON, type BacktestResults, type RiskProfile, type EquityCurvePoint } from "@/lib/api";
 import { Play, RefreshCw, Terminal, Calendar } from "lucide-react";
 
@@ -286,6 +287,17 @@ export default function BacktestPage() {
               </h3>
               <EquityChart curves={curves} selected={selectedRisk} />
             </div>
+
+            {/* Trade list for selected risk */}
+            {p.trade_list && p.trade_list.length > 0 && (
+              <div className="t-panel p-4 mb-4">
+                <h3 className="text-[11px] font-semibold mb-3 uppercase tracking-wider" style={{ color: '#5a6270' }}>
+                  Trade List — <span style={{ color: riskColors[selectedRisk] }}>{selectedRisk}</span>
+                  <span className="ml-2 font-normal" style={{ color: '#3d4450' }}>{p.trade_list.length} trades</span>
+                </h3>
+                <TradeTable trades={p.trade_list} />
+              </div>
+            )}
           </>
         ) : (
           <div className="t-panel p-6 mb-4 text-center text-[11px]" style={{ color: '#3d4450' }}>
