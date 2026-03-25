@@ -103,8 +103,8 @@ export default function FullscreenPnl({ onClose }: { onClose: () => void }) {
         </div>
       </div>
 
-      <p className="absolute bottom-6 text-[10px] tracking-[3px] relative z-10" style={{ color: '#3d4450' }}>
-        PRESS ESC OR F11 TO CLOSE
+      <p className="bottom-6 mt-4 text-[10px] tracking-[3px] z-10" style={{ color: '#3d4450' }}>
+        PRESS ESC TO CLOSE
       </p>
     </div>
   );

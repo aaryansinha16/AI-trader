@@ -9,7 +9,7 @@ Usage:
 """
 
 import os, sys, argparse, shutil
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -67,17 +67,12 @@ def main():
     print("  INCREMENTAL ML MODEL TRAINING")
     print("=" * 60)
 
-    # ── Load recent candle data ──────────────────────────────────────────
-    cutoff = (datetime.now() - timedelta(days=args.days)).strftime("%Y-%m-%d")
-    print(f"  Training on last {args.days} days (since {cutoff})")
-
-    # ── MACRO MODEL ──────────────────────────────────────────────────────
+    # ── MACRO MODEL — full retrain on ALL available candle history ───────
     if not args.micro_only:
         candles = read_sql(
-            f"SELECT timestamp, symbol, open, high, low, close, volume, vwap, oi "
-            f"FROM minute_candles WHERE symbol = 'NIFTY-I' "
-            f"AND timestamp >= '{cutoff}' "
-            f"ORDER BY timestamp"
+            "SELECT timestamp, symbol, open, high, low, close, volume, vwap, oi "
+            "FROM minute_candles WHERE symbol = 'NIFTY-I' "
+            "ORDER BY timestamp"
         )
         if candles.empty:
             print("  WARNING: No candle data found for macro model. Skipping.")
@@ -92,28 +87,17 @@ def main():
             featured = compute_all_macro_indicators(candles)
             print(f"  Featured rows: {len(featured):,}  |  columns: {len(featured.columns)}")
 
-            # ── Train macro model ─────────────────────────────────────────
-            print("\n  --- MACRO MODEL (Incremental) ---")
+            # ── Train macro model (full retrain on all candle history) ────
+            print("\n  --- MACRO MODEL (Full retrain on all candle history) ---")
             macro_trainer = MacroModelTrainer()
-            model_path = "models/saved/macro_model.pkl"
-            if not os.path.exists(model_path):
-                print(f"  No existing model — running full training...")
-                macro_df = macro_trainer.prepare_data(featured.copy())
-                if len(macro_df) > 100:
-                    metrics = macro_trainer.train(macro_df, walk_forward=True, n_splits=5)
-                    macro_trainer.save()
-                    print(f"  Macro model trained: {len(macro_df):,} samples  |  {metrics}")
-                else:
-                    print(f"  Not enough data ({len(macro_df)} samples). Need 100+.")
+            _backup_model(MACRO_MODEL_PATH)
+            macro_df = macro_trainer.prepare_data(featured.copy())
+            if len(macro_df) > 100:
+                metrics = macro_trainer.train(macro_df, walk_forward=True, n_splits=5)
+                macro_trainer.save()
+                print(f"  Macro model trained: {len(macro_df):,} samples  |  {metrics}")
             else:
-                macro_df = macro_trainer.prepare_data(featured.copy())
-                if len(macro_df) > 50:
-                    metrics = macro_trainer.incremental_train(new_df=macro_df, existing_model_path=model_path)
-                    _backup_model(MACRO_MODEL_PATH)
-                    macro_trainer.save()
-                    print(f"  Macro model updated: {len(macro_df):,} samples  |  {metrics}")
-                else:
-                    print(f"  Not enough new data ({len(macro_df)} samples). Need 50+.")
+                print(f"  Not enough data ({len(macro_df)} samples). Need 100+.")
 
             if macro_trainer.model is not None:
                 fi = macro_trainer.get_feature_importance()
@@ -130,14 +114,13 @@ def main():
             except Exception as e:
                 print(f"  Strategy model training error: {e}")
 
-    # ── MICRO MODEL (tick data) ───────────────────────────────────────────
+    # ── MICRO MODEL — full retrain on ALL available tick data ────────────
     if not args.macro_only:
-        print("\n  --- MICRO MODEL (Incremental, tick data) ---")
+        print("\n  --- MICRO MODEL (Full retrain on all available tick data) ---")
         ticks = read_sql(
-            f"SELECT timestamp, symbol, price, volume, bid_price, ask_price, bid_qty, ask_qty, oi "
-            f"FROM tick_data WHERE symbol = 'NIFTY-I' "
-            f"AND timestamp >= '{cutoff}' "
-            f"ORDER BY timestamp"
+            "SELECT timestamp, symbol, price, volume, bid_price, ask_price, bid_qty, ask_qty, oi "
+            "FROM tick_data WHERE symbol = 'NIFTY-I' "
+            "ORDER BY timestamp"
         )
         if ticks.empty:
             print("  WARNING: No tick data found for the specified period. Skipping micro model.")
@@ -153,25 +136,14 @@ def main():
                 print(f"  Micro featured rows: {len(micro_featured):,}  |  columns: {len(micro_featured.columns)}")
 
                 micro_trainer = MicroModelTrainer()
-                micro_model_path = "models/saved/micro_model.pkl"
-                if not os.path.exists(micro_model_path):
-                    print("  No existing micro model — running full training...")
-                    micro_df = micro_trainer.prepare_data(micro_featured.copy())
-                    if len(micro_df) > 100:
-                        metrics = micro_trainer.train(micro_df, walk_forward=True, n_splits=3)
-                        micro_trainer.save()
-                        print(f"  Micro model trained: {len(micro_df):,} samples  |  {metrics}")
-                    else:
-                        print(f"  Not enough micro data ({len(micro_df)} samples). Need 100+.")
+                _backup_model(MICRO_MODEL_PATH_P)
+                micro_df = micro_trainer.prepare_data(micro_featured.copy())
+                if len(micro_df) > 100:
+                    metrics = micro_trainer.train(micro_df, walk_forward=True, n_splits=3)
+                    micro_trainer.save()
+                    print(f"  Micro model trained: {len(micro_df):,} samples  |  {metrics}")
                 else:
-                    micro_df = micro_trainer.prepare_data(micro_featured.copy())
-                    if len(micro_df) > 50:
-                        metrics = micro_trainer.incremental_train(new_df=micro_df, existing_model_path=micro_model_path)
-                        _backup_model(MICRO_MODEL_PATH_P)
-                        micro_trainer.save()
-                        print(f"  Micro model updated: {len(micro_df):,} samples  |  {metrics}")
-                    else:
-                        print(f"  Not enough new tick data ({len(micro_df)} samples). Need 50+.")
+                    print(f"  Not enough micro data ({len(micro_df)} samples). Need 100+.")
             except Exception as e:
                 print(f"  Micro model training error: {e}")
 

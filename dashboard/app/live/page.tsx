@@ -268,7 +268,7 @@ export default function LivePage() {
               <table>
                 <thead>
                   <tr>
-                    {["Time", "Contract", "Dir", "Strategy", "Entry ₹", "Expiry", "ML%", "Score", "Regime", ""].map(h => (
+                    {["Time", "Contract", "Dir", "Strategy", "Risk", "Entry ₹", "SL ₹", "Target ₹", "Expiry", "ML%", "Score", "Regime", ""].map(h => (
                       <th key={h}>{h}</th>
                     ))}
                   </tr>
@@ -283,7 +283,20 @@ export default function LivePage() {
                         <td style={{ color: '#c8cdd5', fontWeight: 600 }}>{t.symbol}</td>
                         <td><Badge label={t.direction} variant={t.direction === "CALL" ? "green" : "red"} /></td>
                         <td style={{ color: '#5a6270' }}>{t.strategy?.replace(/_/g, " ")}</td>
+                        <td>
+                          <span style={{
+                            fontSize: '10px', fontWeight: 700, padding: '2px 6px',
+                            borderRadius: '3px', letterSpacing: '0.05em',
+                            background: t.risk_label === 'LOW' ? '#0d2b1a' : t.risk_label === 'MEDIUM' ? '#2a2000' : '#2a0a0a',
+                            color: t.risk_label === 'LOW' ? '#00e87b' : t.risk_label === 'MEDIUM' ? '#e8c300' : '#ff3e3e',
+                            border: `1px solid ${t.risk_label === 'LOW' ? '#00e87b33' : t.risk_label === 'MEDIUM' ? '#e8c30033' : '#ff3e3e33'}`,
+                          }}>
+                            {t.risk_label ?? '--'}
+                          </span>
+                        </td>
                         <td>{t.entry_premium ? `₹${t.entry_premium}` : "--"}</td>
+                        <td style={{ color: '#ff3e3e' }}>{t.sl_price ? `₹${t.sl_price}` : "--"}</td>
+                        <td style={{ color: '#00e87b' }}>{t.target_price ? `₹${t.target_price}` : "--"}</td>
                         <td style={{ color: '#5a6270' }}>{t.expiry} ({t.dte}d)</td>
                         <td>{(t.ml_prob * 100).toFixed(0)}%</td>
                         <td>

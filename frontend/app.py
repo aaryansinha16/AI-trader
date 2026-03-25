@@ -333,9 +333,32 @@ def _backfill_candles_if_stale():
 def scan_market():
     """Run one scan cycle — compute features, check signals, score trades."""
     global state
+
+    # Only scan during market hours; clear suggestions outside market hours
+    if not _is_market_hours():
+        state["trade_suggestions"] = []
+        state["status"] = "idle"
+        return
+
     state["status"] = "scanning"
 
     try:
+        # ── Expire stale suggestions (older than cooldown window) ─────────
+        now_ts = datetime.now()
+        def _suggestion_age_secs(t):
+            try:
+                ts = datetime.strptime(t.get("time", "00:00:00"), "%H:%M:%S")
+                ts = ts.replace(year=now_ts.year, month=now_ts.month, day=now_ts.day)
+                if ts > now_ts:
+                    ts -= timedelta(days=1)
+                return (now_ts - ts).total_seconds()
+            except Exception:
+                return 9999
+        state["trade_suggestions"] = [
+            t for t in state["trade_suggestions"]
+            if _suggestion_age_secs(t) < SUGGESTION_COOLDOWN_SECS
+        ]
+
         # Auto-backfill if DB is stale during market hours
         _backfill_candles_if_stale()
 
@@ -415,28 +438,64 @@ def scan_market():
             exp_code = expiry.strftime("%y%m%d") if expiry else "000000"
             opt_symbol = f"NIFTY{exp_code}{atm}{opt_type}"
 
+            # Risk label based on score confidence
+            if final_score >= 0.70:
+                risk_label = "LOW"
+            elif final_score >= 0.60:
+                risk_label = "MEDIUM"
+            else:
+                risk_label = "HIGH"
+
+            # Try to get current option LTP from tick cache for SL/target
+            opt_ltp = None
+            try:
+                cache_data = json.loads(open(LIVE_CACHE_FILE).read())
+                tick_entry = cache_data.get(opt_symbol, {})
+                p = float(tick_entry.get("price", 0))
+                if p > 0:
+                    opt_ltp = p
+            except Exception:
+                pass
+            sl_price = round(opt_ltp * (1 - INITIAL_SL_PCT), 2) if opt_ltp else None
+            target_price = round(opt_ltp * (1 + TGT_PCT), 2) if opt_ltp else None
+
+            # Deduplicate: if same signal fired within cooldown, refresh its timestamp
+            cooldown_key = (opt_symbol, sig.direction, sig.strategy)
+            last_fired = _suggestion_cooldown.get(cooldown_key)
+            if last_fired and (datetime.now() - last_fired).total_seconds() < SUGGESTION_COOLDOWN_SECS:
+                # Refresh existing suggestion with latest scores + price
+                for existing in state["trade_suggestions"]:
+                    if existing.get("symbol") == opt_symbol and existing.get("strategy") == sig.strategy:
+                        existing["time"] = datetime.now().strftime("%H:%M:%S")
+                        existing["index_price"] = round(latest.get("close", 0), 1)
+                        existing["ml_prob"] = round(ml_prob, 4)
+                        existing["final_score"] = round(final_score, 4)
+                        existing["risk_label"] = risk_label
+                        if opt_ltp:
+                            existing["entry_premium"] = opt_ltp
+                            existing["sl_price"] = sl_price
+                            existing["target_price"] = target_price
+                continue
+            _suggestion_cooldown[cooldown_key] = datetime.now()
+
             trade = {
                 "time": datetime.now().strftime("%H:%M:%S"),
                 "symbol": opt_symbol,
                 "direction": sig.direction,
                 "strategy": sig.strategy,
-                "entry_premium": None,
+                "entry_premium": opt_ltp,
+                "sl_price": sl_price,
+                "target_price": target_price,
                 "expiry": str(expiry),
                 "dte": dte,
                 "ml_prob": round(ml_prob, 4),
                 "strat_prob": round(strat_prob, 4),
                 "flow_score": round(flow_score, 2),
                 "final_score": round(final_score, 4),
+                "risk_label": risk_label,
                 "regime": regime.value,
                 "index_price": round(latest.get("close", 0), 1),
             }
-
-            # Deduplicate: skip if same signal fired within cooldown window
-            cooldown_key = (opt_symbol, sig.direction, sig.strategy)
-            last_fired = _suggestion_cooldown.get(cooldown_key)
-            if last_fired and (datetime.now() - last_fired).total_seconds() < SUGGESTION_COOLDOWN_SECS:
-                continue
-            _suggestion_cooldown[cooldown_key] = datetime.now()
 
             state["trade_suggestions"].append(trade)
             # Keep only last 50 suggestions to avoid unbounded growth
@@ -1350,10 +1409,27 @@ def api_stream():
     def generate():
         while True:
             try:
-                # Build payload
+                # Build payload — read tick cache first so last_price is real-time
+                cache = {}
+                tick_cache_age = None
+                try:
+                    mtime = os.path.getmtime(LIVE_CACHE_FILE)
+                    age = time.time() - mtime
+                    if age < 30:
+                        cache = json.loads(open(LIVE_CACHE_FILE).read())
+                        tick_cache_age = round(age, 1)
+                except Exception:
+                    pass
+
+                # Use tick cache NIFTY-I price for real-time last_price (falls back to scanner value)
+                last_price = state.get("last_price", 0)
+                nifty_tick = cache.get("NIFTY-I", {})
+                if nifty_tick.get("price", 0):
+                    last_price = nifty_tick["price"]
+
                 payload = {
                     "state": {
-                        "last_price": state.get("last_price", 0),
+                        "last_price": last_price,
                         "regime": state.get("regime", "UNKNOWN"),
                         "status": state.get("status", "idle"),
                         "last_scan": state.get("last_scan"),
@@ -1361,20 +1437,9 @@ def api_stream():
                         "trade_suggestions": state.get("trade_suggestions", []),
                     },
                     "positions_by_mode": paper_positions_by_mode,
-                    "tick_cache": {},
-                    "tick_cache_age": None,
+                    "tick_cache": cache,
+                    "tick_cache_age": tick_cache_age,
                 }
-
-                # Include tick cache
-                try:
-                    mtime = os.path.getmtime(LIVE_CACHE_FILE)
-                    age = time.time() - mtime
-                    if age < 30:
-                        cache = json.loads(open(LIVE_CACHE_FILE).read())
-                        payload["tick_cache"] = cache
-                        payload["tick_cache_age"] = round(age, 1)
-                except Exception:
-                    pass
 
                 # Compute totals per mode
                 for m in ["test", "live"]:
