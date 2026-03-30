@@ -84,6 +84,7 @@ class TrueDataAdapter:
         self._last_request_time: float = 0.0
         self._ws_metadata: Dict = {}  # segments, maxsymbols, validity, etc.
         self._subscribed_symbols: List[str] = []  # tracked for auto-reconnect
+        self._symbol_id_map: Dict[str, str] = {}  # symbolID (str) -> symbol name
 
     # ── Authentication (REST) ───────────────────────────────────────────────
 
@@ -548,8 +549,14 @@ class TrueDataAdapter:
                 total = resp.get("totalsymbolsubscribed", 0)
                 logger.info(f"WebSocket subscribed: {added} added, {total} total")
 
-                # Parse initial snapshots from symbollist
+                # Parse initial snapshots from symbollist and build symbolID map
+                # symbollist format: [symbol, symbolID, ts, LTP, ...]
                 for sym_data in resp.get("symbollist", []):
+                    if isinstance(sym_data, (list, tuple)) and len(sym_data) >= 2:
+                        sym_name = str(sym_data[0]).strip()
+                        sym_id = str(sym_data[1]).strip()
+                        if sym_name and sym_id:
+                            self._symbol_id_map[sym_id] = sym_name
                     tick = self._parse_ws_tick(sym_data)
                     if tick:
                         for cb in self._callbacks:
@@ -557,6 +564,7 @@ class TrueDataAdapter:
                                 cb(tick)
                             except Exception as e:
                                 logger.error(f"Callback error on snapshot: {e}")
+                logger.info(f"Symbol ID map: {len(self._symbol_id_map)} entries")
             else:
                 logger.warning(f"Subscribe response: {resp}")
         except Exception as e:
@@ -588,7 +596,15 @@ class TrueDataAdapter:
             logger.error("WebSocket not connected.")
             return
 
-        self._callbacks.append(callback)
+        # Deduplicate — don't add the same callback twice (happens on reconnect)
+        if callback not in self._callbacks:
+            self._callbacks.append(callback)
+
+        # Stop any existing stream thread before starting a new one
+        if self._streaming and self._stream_thread and self._stream_thread.is_alive():
+            self._streaming = False
+            self._stream_thread.join(timeout=3)
+
         self._streaming = True
 
         def _stream_loop():
@@ -615,16 +631,73 @@ class TrueDataAdapter:
                         logger.debug(f"WS message: {msg.get('message')}")
                         continue
 
-                    # Tick data comes as a JSON array
+                    # Live trade tick: {"trade": [symbolID, ts, LTP, LTQ, ATP, TTQ, O, H, L, prevclose, OI, prevOI, turnover, tag, bid_qty, bid, ask_qty, ask, ...]}
+                    # Note: symbol name is NOT included — must look up from _symbol_id_map
+                    if isinstance(msg, dict) and "trade" in msg:
+                        trade = msg["trade"]
+                        if isinstance(trade, (list, tuple)) and len(trade) >= 3:
+                            sym_id = str(trade[0]).strip()
+                            sym_name = self._symbol_id_map.get(sym_id, "")
+                            if sym_name:
+                                # Build a tick array in the standard format:
+                                # [symbol, symbolID, ts, LTP, tickvol, ATP, totalvol, O, H, L, prevclose, OI, prevOI, turnover, bid, bidqty, ask, askqty]
+                                tick_array = [
+                                    sym_name,        # 0: symbol
+                                    trade[0],        # 1: symbolID
+                                    trade[1] if len(trade) > 1 else "",   # 2: timestamp
+                                    trade[2] if len(trade) > 2 else 0,    # 3: LTP
+                                    trade[3] if len(trade) > 3 else 0,    # 4: LTQ (tickvol)
+                                    trade[4] if len(trade) > 4 else 0,    # 5: ATP
+                                    trade[5] if len(trade) > 5 else 0,    # 6: TTQ (totalvol)
+                                    trade[6] if len(trade) > 6 else 0,    # 7: open
+                                    trade[7] if len(trade) > 7 else 0,    # 8: high
+                                    trade[8] if len(trade) > 8 else 0,    # 9: low
+                                    trade[9] if len(trade) > 9 else 0,    # 10: prevclose
+                                    trade[10] if len(trade) > 10 else 0,  # 11: OI
+                                    trade[11] if len(trade) > 11 else 0,  # 12: prevOI
+                                    trade[12] if len(trade) > 12 else 0,  # 13: turnover
+                                    trade[15] if len(trade) > 15 else 0,  # 14: bid_price
+                                    trade[14] if len(trade) > 14 else 0,  # 15: bid_qty
+                                    trade[17] if len(trade) > 17 else 0,  # 16: ask_price
+                                    trade[16] if len(trade) > 16 else 0,  # 17: ask_qty
+                                ]
+                                tick = self._parse_ws_tick(tick_array)
+                                if tick:
+                                    reconnect_delay = 5
+                                    for cb in self._callbacks:
+                                        try:
+                                            cb(tick)
+                                        except Exception as e:
+                                            logger.error(f"Callback error: {e}")
+                            else:
+                                logger.debug(f"Unknown symbolID in trade: {sym_id}")
+                        continue
+
+                    # Legacy format: plain JSON array tick (kept for backward compat)
                     if isinstance(msg, list) and len(msg) >= 4:
-                        tick = self._parse_ws_tick(msg)
-                        if tick:
-                            reconnect_delay = 5  # reset on successful tick
-                            for cb in self._callbacks:
-                                try:
-                                    cb(tick)
-                                except Exception as e:
-                                    logger.error(f"Callback error: {e}")
+                        if isinstance(msg[0], list):
+                            for item in msg:
+                                tick = self._parse_ws_tick(item)
+                                if tick:
+                                    reconnect_delay = 5
+                                    for cb in self._callbacks:
+                                        try:
+                                            cb(tick)
+                                        except Exception as e:
+                                            logger.error(f"Callback error: {e}")
+                        else:
+                            tick = self._parse_ws_tick(msg)
+                            if tick:
+                                reconnect_delay = 5
+                                for cb in self._callbacks:
+                                    try:
+                                        cb(tick)
+                                    except Exception as e:
+                                        logger.error(f"Callback error: {e}")
+                        continue
+
+                    # Unknown message format — log for debugging
+                    logger.debug(f"WS unknown msg type={type(msg).__name__}: {str(msg)[:100]}")
 
                 except json.JSONDecodeError:
                     logger.debug(f"Non-JSON message: {raw[:100]}")

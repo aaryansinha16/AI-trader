@@ -248,7 +248,8 @@ class MacroModelTrainer:
             logger.info(f"Dropping all-NaN features: {dropped}")
         self.feature_cols = non_null
 
-        # Fill remaining sporadic NaNs (e.g. first few rows for rolling indicators)
+        # Replace inf/-inf with NaN, then fill remaining sporadic NaNs
+        df[non_null] = df[non_null].replace([np.inf, -np.inf], np.nan)
         df[non_null] = df[non_null].ffill().bfill()
         df = df.dropna(subset=non_null + ["target"])
         logger.info(f"Prepared {len(df)} samples with {len(non_null)} features.")
@@ -420,6 +421,7 @@ class MicroModelTrainer:
             logger.info(f"Dropping all-NaN micro features: {dropped}")
         self.feature_cols = non_null
 
+        df[non_null] = df[non_null].replace([np.inf, -np.inf], np.nan)
         df[non_null] = df[non_null].ffill().bfill()
         df = df.dropna(subset=non_null + ["target"])
         logger.info(f"Prepared {len(df)} micro samples with {len(non_null)} features.")

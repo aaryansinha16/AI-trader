@@ -5,11 +5,11 @@ import Sidebar from "@/components/Sidebar";
 import Badge from "@/components/Badge";
 import {
   fetchJSON, postJSON,
-  enterPaperTrade, exitPaperTrade, getPaperPositions, clearClosedPositions,
+  enterPaperTrade, exitPaperTrade, getPaperPositions, clearClosedPositions, setAutoTrade,
   SSE_STREAM_URL,
   type LiveState, type TradeSuggestion, type PaperPosition, type StreamPayload,
 } from "@/lib/api";
-import { RefreshCw, Zap, TrendingUp, TrendingDown, X, Trash2, Radio } from "lucide-react";
+import { RefreshCw, Zap, TrendingUp, TrendingDown, X, Trash2, Radio, Bot, Hand } from "lucide-react";
 import { useTradingMode } from "@/contexts/TradingModeContext";
 
 export default function LivePage() {
@@ -22,6 +22,8 @@ export default function LivePage() {
     test: { open: 0, closed: 0, total: 0 },
     live: { open: 0, closed: 0, total: 0 },
   });
+  const [autoTrade, setAutoTradeState] = useState<boolean>(true);
+  const [togglingAuto, setTogglingAuto] = useState(false);
   const [entering, setEntering] = useState<string | null>(null);
   const [exiting, setExiting] = useState<number | null>(null);
   const [enterError, setEnterError] = useState<string | null>(null);
@@ -47,6 +49,9 @@ export default function LivePage() {
             ...d.state,
           } as LiveState));
           setLastUpdate(new Date().toLocaleTimeString("en-IN"));
+          if (d.state.auto_trade_enabled !== undefined) {
+            setAutoTradeState(d.state.auto_trade_enabled);
+          }
         }
         if (d.positions_by_mode) setPositionsByMode(d.positions_by_mode);
         if (d.tick_cache) setLivePrices(d.tick_cache);
@@ -74,6 +79,16 @@ export default function LivePage() {
     setScanning(true);
     try { await postJSON("/api/scan"); }
     finally { setScanning(false); }
+  };
+
+  const handleToggleAutoTrade = async () => {
+    setTogglingAuto(true);
+    try {
+      const res = await setAutoTrade(!autoTrade);
+      setAutoTradeState(res.auto_trade_enabled);
+    } finally {
+      setTogglingAuto(false);
+    }
   };
 
   const handleEnter = async (t: TradeSuggestion) => {
@@ -121,6 +136,23 @@ export default function LivePage() {
               {sseConnected ? "LIVE" : "RECONNECTING..."}
             </span>
             <span className="text-[10px]" style={{ color: '#3d4450' }}>{lastUpdate}</span>
+
+            {/* Auto / Manual toggle */}
+            <button
+              onClick={handleToggleAutoTrade}
+              disabled={togglingAuto}
+              className="flex items-center gap-1.5 text-[10px] font-semibold px-3 py-1.5 disabled:opacity-50 transition-all"
+              style={{
+                border: `1px solid ${autoTrade ? '#00e87b' : '#4da6ff'}`,
+                color: autoTrade ? '#00e87b' : '#4da6ff',
+                background: autoTrade ? '#0a2a18' : '#0a1a2a',
+                letterSpacing: '0.08em',
+              }}
+            >
+              {autoTrade ? <Bot className="w-3 h-3" /> : <Hand className="w-3 h-3" />}
+              {autoTrade ? "AUTO" : "MANUAL"}
+            </button>
+
             <button onClick={triggerScan} disabled={scanning} className="t-btn flex items-center gap-1.5 disabled:opacity-50">
               {scanning ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Zap className="w-3 h-3" />}
               {scanning ? "SCANNING..." : "SCAN NOW"}
@@ -187,7 +219,7 @@ export default function LivePage() {
               <table>
                 <thead>
                   <tr>
-                    {["Time", "Contract", "Dir", "Entry ₹", "Current ₹", "SL ₹", "Target ₹", "Unrealised P&L", ""].map(h => (
+                    {["Time", "Contract", "Dir", "Entry ₹", "Current ₹", "SL ₹", "Target ₹", "Lots", "Unrealised P&L", ""].map(h => (
                       <th key={h}>{h}</th>
                     ))}
                   </tr>
@@ -224,6 +256,9 @@ export default function LivePage() {
                           )}
                         </td>
                         <td style={{ color: '#00e87b' }}>₹{p.target} <span className="text-[9px]">(+{tgtPct.toFixed(0)}%)</span></td>
+                        <td style={{ color: p.lot_size > 65 ? '#e8c300' : '#5a6270', fontWeight: p.lot_size > 65 ? 700 : 400 }}>
+                          {Math.round(p.lot_size / 65)}×
+                        </td>
                         <td style={{ color: pnlColor, fontWeight: 700 }}>
                           {unrealisedPnl >= 0 ? "+" : ""}₹{unrealisedPnl.toLocaleString("en-IN")}
                         </td>
@@ -250,7 +285,19 @@ export default function LivePage() {
         {/* Signal feed */}
         <div className="t-panel p-4 mb-4">
           <div className="flex items-center justify-between mb-3">
-            <h3 className="text-[11px] font-semibold uppercase tracking-wider" style={{ color: '#5a6270' }}>Trade Suggestions</h3>
+            <div className="flex items-center gap-3">
+              <h3 className="text-[11px] font-semibold uppercase tracking-wider" style={{ color: '#5a6270' }}>Trade Suggestions</h3>
+              <span
+                className="flex items-center gap-1 text-[9px] font-semibold px-2 py-0.5"
+                style={{
+                  border: `1px solid ${autoTrade ? '#00e87b55' : '#4da6ff55'}`,
+                  color: autoTrade ? '#00e87b' : '#4da6ff',
+                  background: autoTrade ? '#0a2a18' : '#0a1a2a',
+                }}
+              >
+                {autoTrade ? <><Bot className="w-2.5 h-2.5" /> AUTO TRADING</> : <><Hand className="w-2.5 h-2.5" /> MANUAL</>}
+              </span>
+            </div>
             <span className="text-[10px]" style={{ color: '#3d4450' }}>AUTO-REFRESH 3S · 5MIN COOLDOWN PER SIGNAL</span>
           </div>
           {enterError && (
@@ -268,7 +315,7 @@ export default function LivePage() {
               <table>
                 <thead>
                   <tr>
-                    {["Time", "Contract", "Dir", "Strategy", "Risk", "Entry ₹", "SL ₹", "Target ₹", "Expiry", "ML%", "Score", "Regime", ""].map(h => (
+                    {["Time", "Contract", "Dir", "Strategy", "Risk", "Entry ₹", "SL ₹", "Target ₹", "Lots", "Expiry", "ML%", "Score", "Regime", ""].map(h => (
                       <th key={h}>{h}</th>
                     ))}
                   </tr>
@@ -297,6 +344,9 @@ export default function LivePage() {
                         <td>{t.entry_premium ? `₹${t.entry_premium}` : "--"}</td>
                         <td style={{ color: '#ff3e3e' }}>{t.sl_price ? `₹${t.sl_price}` : "--"}</td>
                         <td style={{ color: '#00e87b' }}>{t.target_price ? `₹${t.target_price}` : "--"}</td>
+                        <td style={{ color: t.lots && t.lots > 1 ? '#e8c300' : '#5a6270', fontWeight: t.lots && t.lots > 1 ? 700 : 400 }}>
+                          {t.lots ?? 1}×
+                        </td>
                         <td style={{ color: '#5a6270' }}>{t.expiry} ({t.dte}d)</td>
                         <td>{(t.ml_prob * 100).toFixed(0)}%</td>
                         <td>
@@ -309,17 +359,26 @@ export default function LivePage() {
                         </td>
                         <td style={{ color: '#5a6270' }}>{t.regime}</td>
                         <td>
-                          <button
-                            onClick={() => handleEnter(t)}
-                            disabled={isEntering}
-                            className="t-btn flex items-center gap-1 text-[10px] disabled:opacity-50"
-                            style={{ borderColor: '#00e87b', color: '#00e87b', padding: '2px 8px', whiteSpace: 'nowrap' }}
-                          >
-                            {t.direction === "CALL"
-                              ? <TrendingUp className="w-3 h-3" />
-                              : <TrendingDown className="w-3 h-3" />}
-                            {isEntering ? "..." : "ENTER"}
-                          </button>
+                          {autoTrade ? (
+                            <span
+                              className="flex items-center gap-1 text-[9px] font-semibold px-2 py-1"
+                              style={{ color: '#00e87b', background: '#0a2a18', border: '1px solid #00e87b33' }}
+                            >
+                              <Bot className="w-2.5 h-2.5" /> AUTO
+                            </span>
+                          ) : (
+                            <button
+                              onClick={() => handleEnter(t)}
+                              disabled={isEntering}
+                              className="t-btn flex items-center gap-1 text-[10px] disabled:opacity-50"
+                              style={{ borderColor: '#00e87b', color: '#00e87b', padding: '2px 8px', whiteSpace: 'nowrap' }}
+                            >
+                              {t.direction === "CALL"
+                                ? <TrendingUp className="w-3 h-3" />
+                                : <TrendingDown className="w-3 h-3" />}
+                              {isEntering ? "..." : "ENTER"}
+                            </button>
+                          )}
                         </td>
                       </tr>
                     );

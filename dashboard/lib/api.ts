@@ -56,6 +56,7 @@ export interface LiveState {
   signals_checked: number;
   trades_today: number;
   scanner_enabled?: boolean;
+  auto_trade_enabled?: boolean;
 }
 
 export interface TradeSuggestion {
@@ -64,6 +65,9 @@ export interface TradeSuggestion {
   direction: "CALL" | "PUT";
   strategy: string;
   entry_premium: number | null;
+  sl_price: number | null;
+  target_price: number | null;
+  risk_label: "LOW" | "MEDIUM" | "HIGH" | null;
   expiry: string;
   dte: number;
   ml_prob: number;
@@ -72,6 +76,7 @@ export interface TradeSuggestion {
   final_score: number;
   regime: string;
   index_price: number;
+  lots?: number;
 }
 
 export interface Trade {
@@ -211,6 +216,8 @@ export async function enterPaperTrade(suggestion: TradeSuggestion, mode: Trading
     ml_prob: suggestion.ml_prob,
     final_score: suggestion.final_score,
     index_price: suggestion.index_price,
+    sl_pct: (suggestion as unknown as Record<string, number>).sl_pct,
+    target_pct: (suggestion as unknown as Record<string, number>).target_pct,
     mode,
   });
 }
@@ -225,4 +232,8 @@ export async function getPaperPositions(mode: TradingMode = "test"): Promise<Pap
 
 export async function clearClosedPositions(mode: TradingMode = "test"): Promise<void> {
   await postJSON("/api/paper/clear", { mode });
+}
+
+export async function setAutoTrade(enabled: boolean): Promise<{ auto_trade_enabled: boolean }> {
+  return postJSON<{ auto_trade_enabled: boolean }>("/api/auto_trade", { enabled });
 }
