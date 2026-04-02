@@ -180,6 +180,97 @@ class OptionsFlowDetector:
         )
 
 
+def compute_flow_score(latest: dict, direction: str) -> float:
+    """
+    Direction-aware flow score using always-available candle features.
+
+    Uses volume_ratio, MFI, OBV slope as primary inputs (always present),
+    and PCR / OI change as bonus when available.
+
+    Args:
+        latest: dict of latest candle features (from compute_all_macro_indicators)
+        direction: "CALL" or "PUT"
+
+    Returns:
+        float in [0.0, 1.0]
+    """
+    def safe(val, default=0.0):
+        try:
+            v = float(val)
+            return default if (v != v) else v  # NaN check
+        except (TypeError, ValueError):
+            return default
+
+    score = 0.0
+
+    # ── Volume ratio (up to 0.40) ─────────────────────────────────────────────
+    vol_ratio = safe(latest.get("volume_ratio"), 1.0)
+    if vol_ratio > 2.0:
+        score += 0.40
+    elif vol_ratio > 1.5:
+        score += 0.25
+    elif vol_ratio > 1.2:
+        score += 0.15
+    else:
+        score += 0.05
+
+    # ── MFI — direction-aware (up to 0.25) ───────────────────────────────────
+    mfi = safe(latest.get("mfi"), 50.0)
+    if direction == "PUT":
+        # High MFI = money flowing in → bearish exhaustion / reversal signal
+        if mfi > 70:
+            score += 0.25
+        elif mfi > 60:
+            score += 0.12
+        elif mfi > 40:
+            score += 0.04
+    else:  # CALL
+        # Low MFI = money flowing out → bullish exhaustion / reversal signal
+        if mfi < 30:
+            score += 0.25
+        elif mfi < 40:
+            score += 0.12
+        elif mfi < 60:
+            score += 0.04
+
+    # ── OBV slope — direction-aware (up to 0.15) ─────────────────────────────
+    obv_slope = safe(latest.get("obv_slope"), 0.0)
+    if direction == "PUT":
+        if obv_slope < 0:
+            score += 0.15   # falling OBV confirms bearish flow
+        else:
+            score += 0.05
+    else:  # CALL
+        if obv_slope > 0:
+            score += 0.15   # rising OBV confirms bullish flow
+        else:
+            score += 0.05
+
+    # ── PCR + OI change bonus when available (up to 0.20) ────────────────────
+    pcr_raw = latest.get("pcr")
+    pcr = None
+    try:
+        v = float(pcr_raw)
+        if v == v and v > 0:   # not NaN and positive
+            pcr = v
+    except (TypeError, ValueError):
+        pcr = None
+
+    if pcr is not None:
+        if pcr > 1.2:
+            score += 0.12
+        elif pcr < 0.7:
+            score += 0.08
+        else:
+            score += 0.04
+
+        oi_change = safe(latest.get("oi_change"), 0.0)
+        if abs(oi_change) > 1e6:
+            score += 0.08
+
+    return min(score, 1.0)
+
+
 def options_flow_score(option_chain: dict) -> float:
     """Legacy compatibility wrapper."""
     score = 0.0

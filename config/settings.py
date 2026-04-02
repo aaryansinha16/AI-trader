@@ -122,10 +122,12 @@ FEATURE_COLUMNS_MICRO = [
     "volume_burst", "tick_momentum",
 ]
 
-# ── Trade Scoring Weights (from docs) ─────────────────────────────────────────
-WEIGHT_ML_PROBABILITY = 0.5
-WEIGHT_OPTIONS_FLOW = 0.3
-WEIGHT_TECHNICAL_STRENGTH = 0.2
+# ── Trade Scoring Weights ─────────────────────────────────────────────────────
+WEIGHT_ML_PROBABILITY = 0.50
+WEIGHT_OPTIONS_FLOW = 0.30
+WEIGHT_TECHNICAL_STRENGTH = 0.20
+# WEIGHT_STRATEGY_PROB = 0.25  # reserved — strat_prob is used as gate only until models improve
+STRAT_PROB_SCALE = 0.06             # normalize strat_prob raw output to [0,1] when needed
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")

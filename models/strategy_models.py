@@ -61,16 +61,19 @@ def _get_model(model_type: str = "xgboost", **kwargs):
 def generate_strategy_labels(
     df: pd.DataFrame,
     strategy_name: str,
-    forward_periods: int = 15,
-    sl_pct: float = 0.004,
-    tgt_pct: float = 0.004,
+    forward_periods: int = 40,
+    sl_pct: float = 0.003,
+    tgt_pct: float = 0.008,
 ) -> pd.DataFrame:
     """
     Generate labels specific to a strategy.
 
     For each row where the strategy signal fires:
-      - Look forward `forward_periods` bars
-      - Check if price hit target before stop
+      - Look forward `forward_periods` bars (matches max_hold_bars=40)
+      - Check if NIFTY price hit target before stop
+      - sl_pct=0.3%, tgt_pct=0.8% approximate real option RR (~2.5x) via delta
+        (ATM delta≈0.45: 15% option SL ≈ 0.3% NIFTY move; 50% option TGT ≈ 0.8%)
+      - Direction comes from the actual signal (handles mean_reversion CALL/PUT)
       - Label 1 if strategy would have been profitable, 0 otherwise
 
     For rows where the strategy doesn't fire: excluded from training.
@@ -81,14 +84,17 @@ def generate_strategy_labels(
         logger.error(f"Unknown strategy: {strategy_name}")
         return pd.DataFrame()
 
-    # Check which rows trigger this strategy
+    # Check which rows trigger this strategy and record the signal direction
     fires = []
+    directions = []
     for i, row in df.iterrows():
         row_dict = row.to_dict()
         signal = strategy_func(row_dict, "NIFTY-I")
         fires.append(signal is not None)
+        directions.append(signal.direction if signal is not None else None)
 
     df["_fires"] = fires
+    df["_direction"] = directions
     df = df[df["_fires"]].copy()
     df.drop(columns=["_fires"], inplace=True)
 
@@ -97,15 +103,18 @@ def generate_strategy_labels(
         return pd.DataFrame()
 
     # Generate forward return labels
-    # For CALL strategies: did price go up by tgt_pct before dropping sl_pct?
-    # For PUT strategies: did price go down by tgt_pct before rising sl_pct?
+    # Direction-aware: use actual signal direction (PUT or CALL) for each bar.
+    # For PUT: win if NIFTY drops tgt_pct before rising sl_pct (bearish edge).
+    # For CALL: win if NIFTY rises tgt_pct before dropping sl_pct (bullish edge).
     labels = []
     close = df["close"].values
+    signal_dirs = df["_direction"].values
     indices = df.index.tolist()
 
     for j, idx in enumerate(indices):
         pos = df.index.get_loc(idx)
         entry = close[pos]
+        direction = signal_dirs[j]
 
         # Look forward
         won = False
@@ -113,15 +122,15 @@ def generate_strategy_labels(
             future_price = close[pos + k]
             ret = (future_price - entry) / entry
 
-            if strategy_name == "bearish_momentum":
-                # PUT: profit if price drops
+            if direction == "PUT":
+                # PUT: profit if price drops by tgt_pct before rising sl_pct
                 if ret < -tgt_pct:
                     won = True
                     break
                 if ret > sl_pct:
                     break  # stopped out
             else:
-                # CALL: profit if price rises
+                # CALL: profit if price rises by tgt_pct before dropping sl_pct
                 if ret > tgt_pct:
                     won = True
                     break
@@ -131,6 +140,7 @@ def generate_strategy_labels(
         labels.append(1 if won else 0)
 
     df["target"] = labels
+    df.drop(columns=["_direction"], inplace=True, errors="ignore")
 
     pos = sum(labels)
     total = len(labels)
@@ -159,7 +169,7 @@ def train_strategy_model(
     # Select features
     available = [c for c in FEATURE_COLUMNS_MACRO if c in df.columns]
     non_null = [c for c in available if df[c].notna().any()]
-    df[non_null] = df[non_null].ffill().bfill()
+    df[non_null] = df[non_null].replace([np.inf, -np.inf], np.nan).ffill().bfill()
     df = df.dropna(subset=non_null + ["target"])
 
     if len(df) < 50:

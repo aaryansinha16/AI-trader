@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useRef } from "react";
+import React, { useEffect, useState, useRef } from "react";
 import Sidebar from "@/components/Sidebar";
 import Badge from "@/components/Badge";
 import {
@@ -9,7 +9,11 @@ import {
   SSE_STREAM_URL,
   type LiveState, type TradeSuggestion, type PaperPosition, type StreamPayload,
 } from "@/lib/api";
-import { RefreshCw, Zap, TrendingUp, TrendingDown, X, Trash2, Radio, Bot, Hand } from "lucide-react";
+import { RefreshCw, Zap, TrendingUp, TrendingDown, X, Trash2, Radio, Bot, Hand, Activity } from "lucide-react";
+import { LineChart, Line, XAxis, YAxis, Tooltip, ReferenceLine, ResponsiveContainer, CartesianGrid } from "recharts";
+
+type JourneyPoint = { ts: string; option_price: number; nifty_price: number; sl: number; unrealised_pnl: number };
+type JourneyData = { id: number; symbol: string; direction: string; entry_premium: number; initial_sl: number; target: number; status: string; journey: JourneyPoint[] };
 import { useTradingMode } from "@/contexts/TradingModeContext";
 
 export default function LivePage() {
@@ -116,6 +120,35 @@ export default function LivePage() {
 
   const openPositions = positions.filter(p => p.status === "OPEN");
   const closedPositions = positions.filter(p => p.status === "CLOSED");
+
+  // Journey chart state
+  const [journeyId, setJourneyId] = useState<number | null>(null);
+  const [journeyData, setJourneyData] = useState<JourneyData | null>(null);
+  const journeyInterval = useRef<NodeJS.Timeout | null>(null);
+
+  const fetchJourney = async (id: number) => {
+    try {
+      const data = await fetchJSON(`/api/paper/journey/${id}`);
+      setJourneyData(data as JourneyData);
+    } catch { /* silent */ }
+  };
+
+  const toggleJourney = (id: number) => {
+    if (journeyId === id) {
+      // Close
+      setJourneyId(null);
+      setJourneyData(null);
+      if (journeyInterval.current) clearInterval(journeyInterval.current);
+    } else {
+      setJourneyId(id);
+      fetchJourney(id);
+      if (journeyInterval.current) clearInterval(journeyInterval.current);
+      journeyInterval.current = setInterval(() => fetchJourney(id), 5000);
+    }
+  };
+
+  // Clean up interval on unmount
+  useEffect(() => () => { if (journeyInterval.current) clearInterval(journeyInterval.current); }, []);
 
   return (
     <div className="flex min-h-screen">
@@ -237,7 +270,8 @@ export default function LivePage() {
                     const slPct = ((p.sl - p.entry_premium) / p.entry_premium * 100);
                     const tgtPct = ((p.target - p.entry_premium) / p.entry_premium * 100);
                     return (
-                      <tr key={p.id}>
+                      <React.Fragment key={p.id}>
+                      <tr>
                         <td style={{ color: '#5a6270' }}>{p.entry_time}</td>
                         <td style={{ fontWeight: 600 }}>{p.symbol}</td>
                         <td><Badge label={p.direction} variant={p.direction === "CALL" ? "green" : "red"} /></td>
@@ -248,11 +282,14 @@ export default function LivePage() {
                             ({pct >= 0 ? "+" : ""}{pct.toFixed(1)}%)
                           </span>
                         </td>
-                        <td style={{ color: p.trailing_active ? '#e8c300' : '#ff3e3e' }}>
+                        <td style={{ color: p.trailing_active ? '#e8c300' : (p as any).breakeven_locked ? '#00b4ff' : '#ff3e3e' }}>
                           ₹{p.sl}
                           <span className="text-[9px] ml-0.5">({slPct.toFixed(0)}%)</span>
                           {p.trailing_active && (
                             <span className="text-[8px] ml-1 px-1 py-0" style={{ background: '#2a2a0a', border: '1px solid #5c5c1a', color: '#e8c300' }}>TRAIL</span>
+                          )}
+                          {(p as any).breakeven_locked && !p.trailing_active && (
+                            <span className="text-[8px] ml-1 px-1 py-0" style={{ background: '#001a2a', border: '1px solid #005580', color: '#00b4ff' }}>BE</span>
                           )}
                         </td>
                         <td style={{ color: '#00e87b' }}>₹{p.target} <span className="text-[9px]">(+{tgtPct.toFixed(0)}%)</span></td>
@@ -263,17 +300,72 @@ export default function LivePage() {
                           {unrealisedPnl >= 0 ? "+" : ""}₹{unrealisedPnl.toLocaleString("en-IN")}
                         </td>
                         <td>
-                          <button
-                            onClick={() => handleExit(p.id)}
-                            disabled={exiting === p.id}
-                            className="t-btn flex items-center gap-1 text-[10px] disabled:opacity-50"
-                            style={{ borderColor: '#ff3e3e', color: '#ff3e3e', padding: '2px 8px' }}
-                          >
-                            <X className="w-3 h-3" />
-                            {exiting === p.id ? "..." : "EXIT"}
-                          </button>
+                          <div className="flex gap-1">
+                            <button
+                              onClick={() => toggleJourney(p.id)}
+                              className="t-btn flex items-center gap-1 text-[10px]"
+                              style={{ borderColor: journeyId === p.id ? '#00b4ff' : '#2a3040', color: journeyId === p.id ? '#00b4ff' : '#5a6270', padding: '2px 8px' }}
+                              title="View trade journey chart"
+                            >
+                              <Activity className="w-3 h-3" />
+                            </button>
+                            <button
+                              onClick={() => handleExit(p.id)}
+                              disabled={exiting === p.id}
+                              className="t-btn flex items-center gap-1 text-[10px] disabled:opacity-50"
+                              style={{ borderColor: '#ff3e3e', color: '#ff3e3e', padding: '2px 8px' }}
+                            >
+                              <X className="w-3 h-3" />
+                              {exiting === p.id ? "..." : "EXIT"}
+                            </button>
+                          </div>
                         </td>
                       </tr>
+                      {/* Journey chart row */}
+                      {journeyId === p.id && journeyData && (
+                        <tr key={`journey-${p.id}`}>
+                          <td colSpan={10} style={{ padding: '12px 8px', background: '#0d1117', borderBottom: '1px solid #1e2530' }}>
+                            <div style={{ marginBottom: 6, fontSize: 11, color: '#5a6270', display: 'flex', gap: 16, alignItems: 'center' }}>
+                              <span style={{ color: '#e8e8e8', fontWeight: 600 }}>{journeyData.symbol} Journey</span>
+                              <span>{journeyData.journey.length} data points</span>
+                              <span style={{ color: '#00b4ff' }}>Entry ₹{journeyData.entry_premium}</span>
+                              <span style={{ color: '#ff3e3e' }}>SL ₹{journeyData.initial_sl}</span>
+                              <span style={{ color: '#00e87b' }}>Target ₹{journeyData.target}</span>
+                              {journeyData.status === "OPEN" && <span style={{ color: '#e8c300', fontSize: 10 }}>● LIVE — refreshing every 5s</span>}
+                            </div>
+                            {journeyData.journey.length < 2 ? (
+                              <div style={{ color: '#5a6270', fontSize: 11, padding: '8px 0' }}>Collecting data... check back in a few seconds.</div>
+                            ) : (
+                              <ResponsiveContainer width="100%" height={180}>
+                                <LineChart data={journeyData.journey.map(pt => ({
+                                  ...pt,
+                                  time: pt.ts.slice(11, 19),
+                                  entry: journeyData.entry_premium,
+                                }))}>
+                                  <CartesianGrid strokeDasharray="3 3" stroke="#1e2530" />
+                                  <XAxis dataKey="time" tick={{ fontSize: 9, fill: '#5a6270' }} interval="preserveStartEnd" />
+                                  <YAxis domain={['auto', 'auto']} tick={{ fontSize: 9, fill: '#5a6270' }} width={45} />
+                                  <Tooltip
+                                    contentStyle={{ background: '#0d1117', border: '1px solid #1e2530', fontSize: 11 }}
+                                    formatter={(val: unknown, name: unknown) => [`₹${Number(val).toFixed(2)}`, String(name)]}
+                                  />
+                                  {/* Entry line */}
+                                  <ReferenceLine y={journeyData.entry_premium} stroke="#00b4ff" strokeDasharray="4 2" label={{ value: 'Entry', fill: '#00b4ff', fontSize: 9 }} />
+                                  {/* Initial SL line */}
+                                  <ReferenceLine y={journeyData.initial_sl} stroke="#ff3e3e" strokeDasharray="4 2" label={{ value: 'SL', fill: '#ff3e3e', fontSize: 9 }} />
+                                  {/* Target line */}
+                                  <ReferenceLine y={journeyData.target} stroke="#00e87b" strokeDasharray="4 2" label={{ value: 'TGT', fill: '#00e87b', fontSize: 9 }} />
+                                  {/* Option price */}
+                                  <Line type="monotone" dataKey="option_price" stroke="#e8c300" dot={false} strokeWidth={2} name="Option ₹" />
+                                  {/* Live SL (trailing) */}
+                                  <Line type="stepAfter" dataKey="sl" stroke="#ff7a00" dot={false} strokeWidth={1} strokeDasharray="3 2" name="Live SL" />
+                                </LineChart>
+                              </ResponsiveContainer>
+                            )}
+                          </td>
+                        </tr>
+                      )}
+                      </React.Fragment>
                     );
                   })}
                 </tbody>

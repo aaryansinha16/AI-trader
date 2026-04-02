@@ -21,7 +21,7 @@ Intraday NIFTY options paper-trading system. Collects live ticks, trains XGBoost
 
 ```
 ai-trader/
-├── frontend/app.py          # Flask API server (port 5050) — the main backend
+├── backend/app.py          # Flask API server (port 5050) — the main backend
 ├── dashboard/               # Next.js frontend (port 3000)
 │   └── app/
 │       ├── live/            # Live trading page (SSE stream, positions, suggestions)
@@ -31,15 +31,21 @@ ai-trader/
 │       ├── ai/              # AI chat
 │       └── settings/        # Risk profile + config
 ├── scripts/
-│   ├── collect_ticks.py     # LIVE tick collector (runs during market hours)
-│   ├── incremental_train.py # Daily model retraining after market close
-│   ├── fetch_missing_ticks.py  # Backfill single symbol via REST
-│   └── backfill_today.py    # Backfill all today's symbols via REST
+│   ├── collect_ticks.py          # LIVE tick collector (runs during market hours)
+│   ├── incremental_train.py      # Daily macro/micro model retraining after market close
+│   ├── train_outcome_models.py   # Train strategy models on actual trade outcomes (WIN/LOSS)
+│   ├── train_rl_on_journeys.py   # Retrain RL exit agent on all saved journey data
+│   ├── tick_replay_backtest.py   # Tick-level replay backtest engine
+│   ├── fetch_missing_ticks.py    # Backfill single symbol via REST
+│   └── backfill_today.py         # Backfill all today's symbols via REST
 ├── models/
 │   ├── train_model.py       # MacroModelTrainer + MicroModelTrainer classes
 │   ├── strategy_models.py   # Strategy-specific XGBoost models
+│   ├── rl_exit_agent.py     # RLExitAgent (Q-learning, tabular, 8-feature state)
 │   ├── predict.py           # Predictor wrapper (load + infer)
-│   └── saved/               # .pkl files (macro_model.pkl, micro_model.pkl, backups/)
+│   └── saved/               # .pkl files (macro_model.pkl, micro_model.pkl, rl_exit_agent.pkl)
+│       ├── strategy/        # Per-strategy outcome models (bearish_momentum_model.pkl, etc.)
+│       └── backups/YYYYMMDD/ # Date-organized model backups before each retrain
 ├── data/
 │   ├── truedata_adapter.py  # TrueData REST + WebSocket client
 │   └── tick_collector.py    # TickCollector (buffers 200 ticks → DB flush)
@@ -75,7 +81,7 @@ source .venv/bin/activate
 
 ### Backend (Flask API)
 ```bash
-python frontend/app.py              # http://localhost:5050
+python backend/app.py              # http://localhost:5050
 ```
 Auto-starts `collect_ticks.py` during market hours via `_ensure_collector()`.
 
@@ -177,12 +183,44 @@ POST https://auth.truedata.in/token             → bearer token
 |---|---|---|---|
 | Macro | `models/saved/macro_model.pkl` | XGBoost | All minute_candles for NIFTY-I (6+ months) |
 | Micro | `models/saved/micro_model.pkl` | XGBoost | All tick_data (all available days) |
-| Strategy models | `models/saved/strategy/*.pkl` | XGBoost | Per-strategy labeled trades |
+| Strategy models | `models/saved/strategy/*.pkl` | XGBoost | Per-strategy actual trade outcomes (WIN/LOSS) |
+| RL Exit Agent | `models/saved/rl_exit_agent.pkl` | Q-learning | Premium trajectories from all backtest journeys |
 
 ### Training
 - **MacroModelTrainer**: `train(df, walk_forward=True, n_splits=5)` — 5-fold walk-forward validation on 58 features
 - **MicroModelTrainer**: `train(df, walk_forward=True, n_splits=3)` — 3-fold on 5 micro features
-- Always backup existing model before retraining: `models/saved/backups/macro_model_YYYYMMDD_HHMMSS.pkl`
+- Always backup existing model before retraining: `models/saved/backups/YYYYMMDD/model_HHMMSS.pkl`
+
+> **WARNING — Do NOT retrain macro/micro models until there are enough outcome-labeled trades.**
+> Retraining disrupts the XGBoost weights → different entry bar selection → RL agent never sees trained states → RL_EXIT stops firing → fragile P&L baseline breaks.
+> The macro model's label quality is especially sensitive: `generate_macro_labels(forward_periods=15, threshold=0.001)` gives ~14% positive rate and varied 0.2–0.7 outputs. Using higher thresholds (e.g., 0.004/25 bars) compresses all outputs near 0, kills discrimination.
+
+### Outcome-Based Strategy Model Training (NEW)
+```bash
+# Train per-strategy models on ACTUAL trade outcomes from backtest CSVs:
+python scripts/train_outcome_models.py
+
+# Options:
+python scripts/train_outcome_models.py --min-samples 20  # lower threshold
+python scripts/train_outcome_models.py --evaluate        # stats only, no train
+```
+- Reads `backtest_results/trades_{high,medium,low}_risk.csv`
+- For each trade: fetches NIFTY-I candle at `entry_time` from DB → 50-feature vector
+- Labels: 1 = WIN (TRAILING_SL/TIMEOUT/RL_EXIT/EOD_CLOSE/TARGET or pnl>0), 0 = LOSS
+- Saves `models/saved/strategy/{strategy_name}_model.pkl` with backup
+
+### RL Exit Agent — Journey-Based Retraining (NEW)
+```bash
+# Retrain RL Q-learning agent on ALL saved trade journeys:
+python scripts/train_rl_on_journeys.py            # default 30 epochs
+python scripts/train_rl_on_journeys.py --epochs 50
+python scripts/train_rl_on_journeys.py --evaluate  # policy stats only
+python scripts/train_rl_on_journeys.py --fresh     # reset Q-table from scratch
+```
+- Reads `backtest_results/journeys_{high,medium,low}_risk.json`
+- State features are all trade-relative (pnl_pct, bars_held_norm, momentum, etc.) — no entry timing dependency
+- Each epoch shuffles journey order for generalization; best Q-table (by avg reward) is restored at end
+- Run after every significant batch of new backtest trades
 
 ### Features (58 macro, 5 micro)
 **Macro** (from `FEATURE_COLUMNS_MACRO` in settings.py): RSI, MACD, EMA(9/20/50), SMA200, VWAP distance, Bollinger, ATR, StochRSI, Williams%R, ROC, ADX, CCI, OBV slope, MFI, PCR, IV, OI change, days_to_expiry, multi-timeframe RSI/EMA (5m/15m), session time features.
@@ -192,6 +230,21 @@ POST https://auth.truedata.in/token             → bearer token
 ### Trade Scoring
 ```
 final_score = 0.5 × ML_prob + 0.3 × flow_score + 0.2 × technical_strength ± regime_bonus
+```
+- `ML_prob` = directional probability from macro model (CALL: direct, PUT: 1 − prob)
+- `flow_score` = PCR-based: 0.5 default; `min(0.3*(pcr>1.2)+0.2, 1.0)` when PCR available
+- `technical_strength` = from signal generator per-strategy
+
+### Training Workflow (Post-Market)
+```bash
+# 1. Retrain outcome-based strategy models (safe — small XGBoost, separate from macro):
+python scripts/train_outcome_models.py
+
+# 2. Retrain RL agent with new journey data:
+python scripts/train_rl_on_journeys.py --epochs 50
+
+# 3. Full macro/micro retrain (DANGEROUS — only when baseline is confirmed stable):
+python scripts/incremental_train.py
 ```
 
 ---
@@ -204,7 +257,7 @@ final_score = 0.5 × ML_prob + 0.3 × flow_score + 0.2 × technical_strength ± 
 | MEDIUM (Balanced) | 0.60 / 0.70 | 20% | 50% | 5 | 12:30 IST |
 | HIGH (Aggressive) | 0.58 / 0.65 | 20% | 80% | 8 | 13:15 IST |
 
-NIFTY lot size = 65 units. Suggestion SL/target in `frontend/app.py`:
+NIFTY lot size = 65 units. Suggestion SL/target in `backend/app.py`:
 ```python
 INITIAL_SL_PCT = 0.15   # SL = entry × 0.85
 TGT_PCT = 0.50          # Target = entry × 1.50
@@ -213,7 +266,7 @@ SUGGESTION_COOLDOWN_SECS = 300  # 5 min between re-suggesting same signal
 
 ---
 
-## Flask API Routes (frontend/app.py — port 5050)
+## Flask API Routes (backend/app.py — port 5050)
 
 ```
 GET  /api/state                → full scanner state (regime, suggestions, positions)
@@ -291,6 +344,9 @@ state = {
 ## What NOT To Do
 
 - **Don't use `incremental_train.py --days N` where N > 3** — safety guard rejects it; use `main.py train` for full retrains
+- **Don't retrain macro/micro models without a stable backtest baseline** — retraining changes XGBoost weights → different entry bars → RL_EXIT may stop firing → P&L collapses. Always restore from `backups/` if results degrade.
+- **Don't use `generate_macro_labels(threshold > 0.002, forward_periods > 20)`** — higher thresholds yield <5% positive rate → model outputs near-0 for all bars → directional_prob for PUT ≈ 1.0 constant → no signal filtering. Keep `threshold=0.001, forward_periods=15`.
+- **Don't convert IST timestamps to UTC when joining backtest CSVs to DB candles** — both store IST mislabeled as +00:00 (no actual offset). Strip tzinfo and compare naively.
 - **Don't write candles with raw `write_df(..., if_exists='append')`** — use `upsert_candles()` which handles `ON CONFLICT DO NOTHING` on (timestamp, symbol). Bare append causes duplicate key errors.
 - **Don't delete today's candles and re-insert inside `upsert_candles()`** — do the DELETE separately before calling upsert if you need a clean replace
 - **Don't start `collect_ticks.py` as a plain `&` subprocess from a Bash shell** — it gets SIGHUP when the shell exits. Always use `nohup ... &`
@@ -300,6 +356,7 @@ state = {
 - **Don't parse `minute_candles` timestamps as naive datetimes** — they're stored as UTC TIMESTAMPTZ; when comparing to `datetime.now()` (IST), the 5:30h offset matters
 - **Don't add `print()` statements to Flask routes** — use `logger` (Flask stdout is not shown in production)
 - **Don't run Flask in debug mode with the reloader** — the reloader forks processes and double-starts background threads (scanner + tick monitor run twice)
+- **Don't re-enable `max_trades_day` gate until outcome models have AUC > 0.55** — currently disabled in both `backend/app.py` and `tick_replay_backtest.py` to collect more training data. The gate is commented with `# TEMP: disabled to collect more training data`
 
 ---
 

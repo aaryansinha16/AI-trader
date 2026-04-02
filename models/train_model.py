@@ -62,7 +62,11 @@ def generate_macro_labels(
     Generate labels for the Macro Model.
 
     Default target: "Did price move +0.1% in next 15 minutes?"
-    Tuned for ~13% positive rate to avoid extreme class imbalance.
+    Tuned for ~13% positive rate — important for calibrated probability outputs.
+    NOTE: threshold=0.004/forward=25 (tried 2026-04-02) gave AUC=0.797 but
+    2.2% positive rate → model outputs near-0 for all bars → directional_prob
+    for PUT = 1-0.02 = 0.98 (constant) → no signal discrimination.
+    0.001/15 gives 14% positive rate with varied outputs in 0.2-0.7 range.
     Can be swapped to strategy-outcome labels once trade log exists.
 
     Args:

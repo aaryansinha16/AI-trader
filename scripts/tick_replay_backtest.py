@@ -14,7 +14,7 @@ Usage:
   python scripts/tick_replay_backtest.py 2026-03-10 2026-03-11  # specific days
 """
 
-import os, sys, argparse
+import os, sys, argparse, json
 from datetime import datetime, date, timedelta
 from pathlib import Path
 
@@ -99,6 +99,12 @@ REGIME_LOT_MULTIPLIER = _build_regime_multipliers(_PROFILE)
 # Micro model entry confirmation
 MICRO_MOMENTUM_THRESHOLD = 0.1
 
+# Bid/Ask spread model — realistic slippage for NIFTY ATM options
+# Entry: pay ask = close * (1 + HALF_SPREAD_PCT)
+# Exit:  receive bid = close * (1 - HALF_SPREAD_PCT)
+# ATM options spread ~₹0.15-0.30 on ₹40-100 premium → ~0.3% each side
+HALF_SPREAD_PCT = 0.003
+
 
 def apply_risk_profile(level: RiskLevel):
     """Apply a risk profile to all module-level trading parameters."""
@@ -162,20 +168,38 @@ def minutes_from_open(ts) -> int:
     return h * 60 + m - MARKET_OPEN_MIN
 
 
-def dynamic_sl_tgt(atr_pct: float) -> tuple:
+def dynamic_sl_tgt(atr_pct: float, final_score: float = 0.0) -> tuple:
     """
-    Scale SL and TGT percentages by current ATR relative to baseline.
-    
+    Scale SL and TGT percentages by current ATR and signal score.
+
     High vol → widen SL (give room) but also widen TGT (bigger moves possible)
     Low vol  → tighten SL and TGT (smaller moves, take profits quickly)
+    Score-tiered boost: strong signals get tighter SL and wider TGT.
     """
     if atr_pct <= 0 or np.isnan(atr_pct):
-        return SL_PCT, TGT_PCT
+        sl, tgt = SL_PCT, TGT_PCT
+    else:
+        ratio = atr_pct / ATR_BASELINE  # >1 = high vol, <1 = low vol
+        sl = np.clip(SL_PCT * ratio, SL_MIN_PCT, SL_MAX_PCT)
+        tgt = np.clip(TGT_PCT * ratio, TGT_MIN_PCT, TGT_MAX_PCT)
 
-    ratio = atr_pct / ATR_BASELINE  # >1 = high vol, <1 = low vol
-    sl = np.clip(SL_PCT * ratio, SL_MIN_PCT, SL_MAX_PCT)
-    tgt = np.clip(TGT_PCT * ratio, TGT_MIN_PCT, TGT_MAX_PCT)
+    # Score-based tgt boost: high-conviction signals deserve larger targets
+    if final_score >= 0.80:
+        sl = min(sl, 0.15)            # tighten SL cap on best signals
+        tgt = max(tgt, TGT_MAX_PCT)   # aim for ceiling on best signals
+    elif final_score >= 0.70:
+        tgt = max(tgt, TGT_MIN_PCT + 0.10)  # nudge target up
+
     return round(sl, 3), round(tgt, 3)
+
+
+def score_lot_multiplier(final_score: float) -> int:
+    """Dynamic lot multiplier based on signal strength (aligned with live system)."""
+    if final_score >= 0.80:
+        return 3
+    elif final_score >= 0.70:
+        return 2
+    return 1
 
 
 def kelly_lot_size(
@@ -321,8 +345,16 @@ class OpenTrade:
         self.exit_premium = None
         self.result = None
         self.pnl = None
+        # Per-bar journey: [{ts, premium, sl, nifty_price, bars_held}]
+        self.journey = [{
+            "ts": str(entry_time),
+            "premium": round(entry_premium, 2),
+            "sl": round(self.sl, 2),
+            "nifty_price": round(index_price, 1),
+            "bars_held": 0,
+        }]
 
-    def check_exit(self, current_minute, bar_idx) -> bool:
+    def check_exit(self, current_minute, bar_idx, nifty_close: float = 0.0) -> bool:
         """Check SL/target/timeout against option premium at current_minute.
         
         If an RL agent is available, it can override HOLD decisions by choosing
@@ -335,14 +367,28 @@ class OpenTrade:
         if row.empty:
             return False
 
-        p_high = float(row.iloc[0].get("high", row.iloc[0]["premium"]))
-        p_low  = float(row.iloc[0].get("low", row.iloc[0]["premium"]))
+        p_high  = float(row.iloc[0].get("high", row.iloc[0]["premium"]))
+        p_low   = float(row.iloc[0].get("low", row.iloc[0]["premium"]))
         p_close = float(row.iloc[0]["premium"])
         bars_held = bar_idx - self.entry_bar_idx
 
+        # Apply bid-side slippage — we receive bid (= close - spread) when selling
+        p_high_bid  = p_high  * (1 - HALF_SPREAD_PCT)
+        p_low_bid   = p_low   * (1 - HALF_SPREAD_PCT)
+        p_close_bid = p_close * (1 - HALF_SPREAD_PCT)
+
         self.premium_history.append(p_close)
 
-        # Track peak and activate / update trailing stop
+        # Record journey point for this bar
+        self.journey.append({
+            "ts": str(current_minute),
+            "premium": round(p_close, 2),
+            "sl": round(self.sl, 2),
+            "nifty_price": round(nifty_close, 1),
+            "bars_held": bars_held,
+        })
+
+        # Track peak using mid price (internal reference, not adjusted)
         self.peak_premium = max(self.peak_premium, p_high)
         if not self.trailing_active:
             gain_pct = (self.peak_premium - self.entry_premium) / self.entry_premium
@@ -379,14 +425,15 @@ class OpenTrade:
         result = None
 
         # Hard safety rails — always enforced
-        if p_low <= self.sl:
-            exit_prem = self.sl
+        # Use bid prices (what we actually receive when selling)
+        if p_low_bid <= self.sl:
+            exit_prem = min(p_low_bid, self.sl)  # realistic: might gap below SL
             result = "TRAILING_SL" if self.trailing_active else "SL"
-        elif p_high >= self.target:
-            exit_prem = self.target
+        elif p_high_bid >= self.target:
+            exit_prem = self.target  # target fills at limit — receive bid = target level
             result = "TARGET"
         elif bars_held >= MAX_HOLD_BARS:
-            exit_prem = p_close
+            exit_prem = p_close_bid  # market exit at bid
             result = "TIMEOUT"
 
         # RL agent override (only when no hard exit triggered)
@@ -406,7 +453,7 @@ class OpenTrade:
                 action = self.rl_agent.decide(state, explore=False)
 
                 if action == "EXIT":
-                    exit_prem = p_close
+                    exit_prem = p_close_bid  # RL exit at bid
                     result = "RL_EXIT"
                 elif action == "TIGHTEN":
                     if p_close > self.entry_premium:
@@ -447,6 +494,7 @@ class OpenTrade:
             "final_score": round(self.final_score, 4),
             "regime": self.regime,
             "index_price": round(self.index_price, 1),
+            "journey": self.journey,
         }
 
 
@@ -506,19 +554,31 @@ def replay_day(
     _wins = list(rolling_wins) if rolling_wins else []
     # Daily loss circuit breaker: stop trading if cumulative loss exceeds threshold
     daily_loss_limit = -(_PROFILE.max_capital_per_trade * equity * 3)
+    # Consecutive SL circuit breaker: after 2 hard SL hits in a row, pause 30 bars
+    # (2026-03-27: 3 SL hits in 71 min; 2026-03-30: 2 in 59 min — system stuck in wrong direction)
+    consecutive_sl_hits = 0
+    sl_pause_until_bar = -1  # bar index after which trading resumes
 
     # ── Stream minutes ───────────────────────────────────────────────────
     for bar_idx, minute_ts in enumerate(minutes):
         minute_ticks = minute_groups.get_group(minute_ts)
 
         # ── 1. Check open trade exit ─────────────────────────────────────
+        nifty_close_now = float(minute_ticks["price"].iloc[-1])
         if open_trade is not None:
-            if open_trade.check_exit(minute_ts, bar_idx):
+            if open_trade.check_exit(minute_ts, bar_idx, nifty_close=nifty_close_now):
                 completed_trades.append(open_trade.to_dict())
                 t = open_trade
                 daily_pnl += t.pnl
                 equity += t.pnl
                 _wins.append(1 if t.pnl > 0 else 0)
+                # Consecutive SL tracking: count hard SL hits, reset on any profit/trailing
+                if t.result == "SL":
+                    consecutive_sl_hits += 1
+                    if consecutive_sl_hits >= 2:
+                        sl_pause_until_bar = bar_idx + 30  # 30-min cooling off
+                else:
+                    consecutive_sl_hits = 0  # any non-SL exit resets the streak
                 if verbose:
                     pnl_str = f"₹{t.pnl:+,.0f}"
                     color = "\033[92m" if t.pnl > 0 else "\033[91m"
@@ -545,10 +605,12 @@ def replay_day(
         # ── 3. Skip if in trade, max trades, circuit breaker, or not enough warmup
         if open_trade is not None:
             continue
-        if daily_trades >= MAX_TRADES_DAY:
-            continue
+        # if daily_trades >= MAX_TRADES_DAY:  # TEMP: disabled to collect more training data
+        #     continue
         if daily_pnl <= daily_loss_limit:
             continue  # circuit breaker: stop trading after large intraday loss
+        if bar_idx <= sl_pause_until_bar:
+            continue  # cooling off after 2 consecutive SL hits
         if len(candle_buffer) < 250:
             continue
 
@@ -627,10 +689,6 @@ def replay_day(
                 if p is not None:
                     ml_prob = p
 
-            # 8b. PUT gate (stricter — PUTs need strong bearish conviction)
-            if sig.direction == "PUT" and ml_prob > 0.30:
-                continue
-
             # 8c. Strategy-specific ML (fallback if out-of-distribution)
             strat_prob = strategy_predictor.predict(sig.strategy, latest)
             if strat_prob is None or strat_prob < 0.05:
@@ -647,6 +705,18 @@ def replay_day(
                 if oi_change and not np.isnan(oi_change) and abs(oi_change) > 1e6:
                     flow_score += 0.3
                 flow_score = min(flow_score + 0.2, 1.0)
+            else:
+                # OBV slope + MFI fallback when PCR is unavailable (early session, candle gaps)
+                # Direction-aware: positive OBV/high MFI = bullish = good for CALL / bad for PUT
+                obv_slope = latest.get("obv_slope", 0) or 0
+                mfi = latest.get("mfi", 50) or 50
+                if sig.direction == "CALL":
+                    obv_contrib = 0.15 if obv_slope > 0 else (-0.10 if obv_slope < 0 else 0.0)
+                    mfi_contrib = 0.15 if mfi > 60 else (-0.10 if mfi < 40 else 0.0)
+                else:  # PUT
+                    obv_contrib = 0.15 if obv_slope < 0 else (-0.10 if obv_slope > 0 else 0.0)
+                    mfi_contrib = 0.15 if mfi < 40 else (-0.10 if mfi > 60 else 0.0)
+                flow_score = max(0.20, min(1.0, 0.50 + obv_contrib + mfi_contrib))
 
             # 8e. Regime bonus / penalty
             regime_bonus = 0.05 if regime_strategies and sig.strategy in regime_strategies else 0.0
@@ -666,21 +736,50 @@ def replay_day(
                 + regime_bonus
                 + news_boost
             )
-            # Higher bar for PUTs
+            # Direction-based quality gate
             min_score = _PROFILE.put_score_threshold if sig.direction == "PUT" else _PROFILE.score_threshold
+
+            # Strategy-specific overrides (evidence-based from backtest with real slippage)
+            if sig.strategy == "mean_reversion":
+                # Only fire in SIDEWAYS/LOW_VOLATILITY — in trending markets it fights the trend and loses
+                # (2026-03-25: 2 SL hits with scores 0.90-0.94 in what was a TRENDING session)
+                if regime not in (MarketRegime.SIDEWAYS, MarketRegime.LOW_VOLATILITY):
+                    continue
+                # ML must confirm direction: directional_prob < 0.40 means model is actively bearish/bullish
+                # against the signal — counter-trend entries without ML backing have poor outcomes
+                if directional_prob < 0.40:
+                    continue
+                min_score = max(min_score, 0.80)
+            elif sig.strategy == "vwap_momentum_breakout":
+                # Re-enabled: requires TRENDING_BULL regime and strong score (CALL only, bullish breakout)
+                if regime not in (MarketRegime.TRENDING_BULL, MarketRegime.LOW_VOLATILITY):
+                    continue
+                min_score = max(min_score, 0.65)
             if final_score < min_score:
                 if verbose:
                     print(
                         f"    SKIP  {sig.strategy} {sig.direction}  "
                         f"score={final_score:.3f} < {min_score}  "
                         f"(ml={directional_prob:.3f} flow={flow_score:.3f} tech={sig.technical_strength:.3f} "
-                        f"regime_bonus={regime_bonus:.2f} news={news_boost:.2f})"
+                        f"strat={strat_prob:.3f} regime_bonus={regime_bonus:.2f} news={news_boost:.2f})"
                     )
                 continue
 
             signals_passed += 1
 
-            # ── 9a. Micro-level entry confirmation ────────────────────
+            # ── 9a. Previous-bar NIFTY direction confirmation for expensive options ─
+            # 10 of 13 MEDIUM SL hits were high-premium (>₹120) — the index often moved
+            # against the signal direction in the previous bar, a "false breakout" indicator.
+            # Require last completed bar to not be STRONGLY counter-directional (>0.1% move).
+            if len(featured) >= 2:
+                prev_bar = featured.iloc[-2]
+                prev_move_pct = (float(prev_bar["close"]) - float(prev_bar["open"])) / max(float(prev_bar["open"]), 1)
+                if sig.direction == "PUT" and prev_move_pct > 0.0010:
+                    continue  # previous bar strongly bullish → skip PUT entry
+                if sig.direction == "CALL" and prev_move_pct < -0.0010:
+                    continue  # previous bar strongly bearish → skip CALL entry
+
+            # ── 9b. Micro-level entry confirmation ────────────────────
             if not check_micro_confirmation(minute_ticks, sig.direction):
                 continue  # tick momentum opposes our direction
 
@@ -701,7 +800,8 @@ def replay_day(
             if opt is None:
                 continue
 
-            entry_prem = opt["entry_premium"]
+            # Apply ask-side slippage — we pay ask (= close + spread) when buying
+            entry_prem = opt["entry_premium"] * (1 + HALF_SPREAD_PCT)
             if entry_prem <= 0:
                 continue
             # Regime-aware premium cap: tighter in volatile markets
@@ -713,21 +813,20 @@ def replay_day(
             if entry_prem > effective_max_prem:
                 continue
 
-            # ── 9c. Dynamic SL/Target based on ATR ────────────────────
+            # ── 9c. Dynamic SL/Target based on ATR + score ────────────
             atr_pct = latest.get("atr_pct", 0)
-            sl_pct, tgt_pct = dynamic_sl_tgt(atr_pct)
+            sl_pct, tgt_pct = dynamic_sl_tgt(atr_pct, final_score)
 
-            # ── 9d. Kelly + regime-aware lot sizing ──────────────────
-            recent = _wins[-20:] if len(_wins) >= 5 else None
-            if recent:
-                wr_est  = sum(recent) / len(recent)
-                win_trades  = [t for t in completed_trades[-20:] if t["pnl"] > 0]
-                loss_trades = [t for t in completed_trades[-20:] if t["pnl"] <= 0]
-                avg_w = np.mean([t["pnl"] / (t["entry_premium"] * t["lot_size"]) for t in win_trades]) if win_trades else 0.45
-                avg_l = abs(np.mean([t["pnl"] / (t["entry_premium"] * t["lot_size"]) for t in loss_trades])) if loss_trades else 0.30
-                lot_sz = kelly_lot_size(regime, entry_prem, equity, wr_est, avg_w, avg_l)
+            # ── 9d. Score-tiered lot sizing (aligned with live _lots_for_score) ─────
+            # Kelly at ₹50K equity always resolves to 1 lot, then score-bonus adds +1 → every
+            # trade was 2 lots regardless of conviction. Explicit tiers are transparent and match
+            # the live backend exactly: 1 lot (0.60-0.70) / 2 lots (0.70-0.80) / 3 lots (0.80+)
+            if final_score >= 0.80:
+                lot_sz = BASE_LOT_SIZE * 3  # 195 units (3 lots)
+            elif final_score >= 0.70:
+                lot_sz = BASE_LOT_SIZE * 2  # 130 units (2 lots)
             else:
-                lot_sz = regime_lot_size(regime)  # fallback until enough history
+                lot_sz = BASE_LOT_SIZE      # 65 units (1 lot)
 
             # ── 10. Open trade ───────────────────────────────────────────
             open_trade = OpenTrade(
@@ -768,7 +867,7 @@ def replay_day(
         mask = (open_trade.premium_df["timestamp"] - ts).abs() <= pd.Timedelta(minutes=2)
         row = open_trade.premium_df[mask]
         if not row.empty:
-            exit_prem = float(row.iloc[-1]["premium"])
+            exit_prem = float(row.iloc[-1]["premium"]) * (1 - HALF_SPREAD_PCT)  # receive bid at EOD
         else:
             exit_prem = open_trade.entry_premium  # flat
         open_trade.exit_time = minutes[-1]
@@ -1003,13 +1102,21 @@ def main():
     # Export — write both a generic file and the per-risk file the dashboard API reads
     out_dir = Path("backtest_results")
     out_dir.mkdir(exist_ok=True)
-    clean_df = df.drop(columns=["cum_pnl", "day"], errors="ignore")
+
+    # Save journeys separately (lists can't go into CSV)
+    journeys = {i: t.get("journey", []) for i, t in enumerate(all_trades)}
+    journey_path = out_dir / f"journeys_{_PROFILE.level.value}_risk.json"
+    with open(journey_path, "w") as f:
+        json.dump(journeys, f)
+    print(f"\n  Trade journeys:    {journey_path} ({len(journeys)} trades)")
+
+    clean_df = df.drop(columns=["cum_pnl", "day", "journey"], errors="ignore")
     csv_path = out_dir / "tick_replay_trades.csv"
     clean_df.to_csv(csv_path, index=False)
     # Per-risk file consumed by /api/backtest/results
     risk_csv_path = out_dir / f"trades_{_PROFILE.level.value}_risk.csv"
     clean_df.to_csv(risk_csv_path, index=False)
-    print(f"\n  Trades exported to {csv_path}")
+    print(f"  Trades exported to {csv_path}")
     print(f"  Dashboard results: {risk_csv_path}")
     print("=" * 60)
 

@@ -162,8 +162,8 @@ def get_option_symbols_for_today(index_price: float) -> list:
     today = date.today()
     expiry = get_nearest_expiry(today)
     if not expiry:
-        # Fallback: next Thursday
-        days_ahead = 3 - today.weekday()  # Thursday = 3
+        # Fallback: next Tuesday (NIFTY weekly expiry day)
+        days_ahead = 1 - today.weekday()  # Tuesday = 1
         if days_ahead <= 0:
             days_ahead += 7
         expiry = today + timedelta(days=days_ahead)
@@ -241,7 +241,14 @@ def on_tick(tick: dict):
     # not the market timestamp (which can be hours old for illiquid options snapshots).
     price = tick.get("price", 0)
     if price and price > 0:
-        entry = {"price": price, "ts": datetime.now().isoformat()}
+        bid = tick.get("bid_price") or price
+        ask = tick.get("ask_price") or price
+        entry = {
+            "price": price,
+            "bid": bid,
+            "ask": ask,
+            "ts": datetime.now().isoformat(),
+        }
         live_price_cache[symbol] = entry
         if original_symbol != symbol:
             live_price_cache[original_symbol] = entry
