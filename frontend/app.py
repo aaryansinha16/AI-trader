@@ -49,7 +49,8 @@ app = Flask(__name__)
 CORS(app)  # Allow Next.js dev server on :3000
 
 # ── Global State ──────────────────────────────────────────────────────────────
-scanner_enabled = True  # Start/stop toggle for the background scanner
+scanner_enabled = True      # Start/stop toggle for the background scanner
+auto_trade_enabled = True   # Auto-enter paper trades when signals fire (vs manual)
 
 state = {
     "status": "initializing",
@@ -64,6 +65,7 @@ state = {
     "signals_checked": 0,
     "trades_today": 0,
     "scanner_enabled": True,
+    "auto_trade_enabled": True,
 }
 
 # Cooldown tracker: key=(symbol, direction, strategy) → last suggestion datetime
@@ -83,7 +85,73 @@ def _get_mode_positions(mode: str = None) -> list:
         mode = "test"
     return paper_positions_by_mode[mode]
 
+
+def _auto_enter_position(trade: dict, trade_mode: str = "test"):
+    """Auto-enter a paper position from a signal suggestion (no HTTP request needed)."""
+    positions = paper_positions_by_mode.get(trade_mode, paper_positions_by_mode["test"])
+
+    # Skip if already have an open position for this symbol
+    if any(p["symbol"] == trade["symbol"] and p["status"] == "OPEN" for p in positions):
+        logger.debug(f"Auto-trade skipped: already have open position for {trade['symbol']}")
+        return
+
+    entry_premium = trade.get("entry_premium")
+    if not entry_premium or entry_premium <= 0:
+        logger.debug(f"Auto-trade skipped: no live premium available for {trade['symbol']}")
+        return
+
+    ep = round(float(entry_premium), 2)
+    sl_pct = trade.get("sl_pct", INITIAL_SL_PCT)
+    target_pct = trade.get("target_pct", TGT_PCT)
+    final_score = trade.get("final_score", 0.5)
+    initial_sl = round(ep * (1 - sl_pct), 2)
+    lots = _lots_for_score(final_score)
+    position = {
+        "id": int(datetime.now().timestamp() * 1000),
+        "entry_time": datetime.now().strftime("%H:%M:%S"),
+        "symbol": trade["symbol"],
+        "direction": trade["direction"],
+        "strategy": trade.get("strategy", ""),
+        "entry_premium": ep,
+        "sl": initial_sl,
+        "initial_sl": initial_sl,
+        "target": round(ep * (1 + target_pct), 2),
+        "max_premium": ep,
+        "trailing_active": False,
+        "lot_size": LOT_SIZE * lots,
+        "ml_prob": trade.get("ml_prob", 0.5),
+        "final_score": final_score,
+        "index_price": trade.get("index_price", 0),
+        "expiry": trade.get("expiry", ""),
+        "status": "OPEN",
+        "current_premium": ep,
+        "unrealised_pnl": 0.0,
+        "exit_time": None,
+        "exit_premium": None,
+        "realised_pnl": None,
+        "exit_reason": None,
+        "mode": trade_mode,
+        "auto_entered": True,
+    }
+    positions.append(position)
+    logger.info(
+        f"AUTO-TRADE [{trade_mode.upper()}]: {trade['direction']} {trade['symbol']} "
+        f"@ ₹{ep} | SL=₹{initial_sl} TGT=₹{position['target']} | {lots} lot(s) (score={final_score:.3f})"
+    )
+    _ensure_tick_monitor()
+    _ensure_collector()
+
 LOT_SIZE = 65
+MAX_LOTS = 3                 # Cap lot multiplier at 3 lots
+
+def _lots_for_score(final_score: float) -> int:
+    """Dynamic lot sizing based on signal strength."""
+    if final_score >= 0.80:
+        return 3
+    elif final_score >= 0.70:
+        return 2
+    return 1
+
 INITIAL_SL_PCT = 0.15       # Initial SL at 15% below entry
 TRAIL_ACTIVATE_PCT = 0.10   # Start trailing once profit > 10%
 TRAIL_FACTOR = 0.50         # Trail SL at 50% of max profit
@@ -94,6 +162,7 @@ LIVE_CACHE_FILE = "/tmp/td_live_prices.json"
 # Background processes
 _tick_monitor_thread = None
 _collector_process = None
+_tick_monitor_rest_ts: dict = {}  # symbol -> last REST fallback timestamp
 
 predictor = Predictor()
 strategy_predictor = StrategyPredictor()
@@ -296,7 +365,13 @@ def _is_market_hours() -> bool:
 
 
 def _backfill_candles_if_stale():
-    """If the latest NIFTY-I candle in DB is >2 min old during market hours, fetch fresh bars."""
+    """
+    During market hours:
+    1. If NIFTY-I candles are >2 min old, fetch fresh bars from REST.
+    2. If the current ATM option has no candles today, fetch its full-day bars.
+       This handles the case where NIFTY moves significantly after market open
+       and the new ATM strike was never subscribed by the tick collector.
+    """
     if not _is_market_hours():
         return
     try:
@@ -307,25 +382,74 @@ def _backfill_candles_if_stale():
             return
         latest_ts = pd.to_datetime(stale.iloc[0]["latest"], utc=True)
         age_seconds = (pd.Timestamp.now(tz="UTC") - latest_ts).total_seconds()
-        if age_seconds < 120:
-            return
+
         from data.truedata_adapter import TrueDataAdapter
         from database.db import upsert_candles
+        from backtest.option_resolver import get_nearest_expiry
+
+        need_td = age_seconds >= 120
+        # Also check if current ATM options are missing
+        nifty_close = state.get("last_price", 0)
+        atm_missing_syms = []
+        if nifty_close > 0:
+            atm = round(nifty_close / 50) * 50
+            today = date.today()
+            expiry = get_nearest_expiry(today)
+            if expiry:
+                exp_code = expiry.strftime("%y%m%d")
+                for delta in range(-3, 4):
+                    strike = atm + delta * 50
+                    for opt in ["CE", "PE"]:
+                        sym = f"NIFTY{exp_code}{strike}{opt}"
+                        chk = read_sql(
+                            "SELECT 1 FROM minute_candles WHERE symbol = :s AND timestamp::date = :d LIMIT 1",
+                            {"s": sym, "d": today.isoformat()}
+                        )
+                        if chk.empty:
+                            atm_missing_syms.append(sym)
+
+        if not need_td and not atm_missing_syms:
+            return
+
         td = TrueDataAdapter()
         if not td.authenticate():
             return
-        start_dt = latest_ts.tz_convert("Asia/Kolkata").replace(tzinfo=None)
+
+        today = date.today()
+        day_start = datetime(today.year, today.month, today.day, 9, 15, 0)
         end_dt = datetime.now()
-        bars = td.fetch_historical_bars("NIFTY-I", start_dt, end_dt, interval="1min")
-        if bars.empty:
-            return
-        for col in ["vwap", "oi"]:
-            if col not in bars.columns:
-                bars[col] = 0
-        bars = bars[["timestamp", "symbol", "open", "high", "low", "close", "volume", "vwap", "oi"]]
-        inserted = upsert_candles(bars)
-        if inserted:
-            logger.info(f"Auto-backfill: inserted {inserted} fresh candles (was {age_seconds:.0f}s stale)")
+
+        # 1. Top-up NIFTY-I if stale
+        if need_td:
+            start_dt = latest_ts.tz_convert("Asia/Kolkata").replace(tzinfo=None)
+            bars = td.fetch_historical_bars("NIFTY-I", start_dt, end_dt, interval="1min")
+            if not bars.empty:
+                for col in ["vwap", "oi"]:
+                    if col not in bars.columns:
+                        bars[col] = 0
+                bars = bars[["timestamp", "symbol", "open", "high", "low", "close", "volume", "vwap", "oi"]]
+                inserted = upsert_candles(bars)
+                if inserted:
+                    logger.info(f"Auto-backfill NIFTY-I: {inserted} new candles (was {age_seconds:.0f}s stale)")
+
+        # 2. Fetch missing ATM option candles
+        if atm_missing_syms:
+            logger.info(f"Auto-backfill: fetching {len(atm_missing_syms)} missing ATM option symbols")
+            import time as _time
+            for sym in atm_missing_syms:
+                try:
+                    bars = td.fetch_historical_bars(sym, day_start, end_dt, interval="1min")
+                    if not bars.empty:
+                        for col in ["vwap", "oi"]:
+                            if col not in bars.columns:
+                                bars[col] = 0
+                        bars = bars[["timestamp", "symbol", "open", "high", "low", "close", "volume", "vwap", "oi"]]
+                        upsert_candles(bars)
+                        logger.info(f"Auto-backfill {sym}: {len(bars)} bars")
+                    _time.sleep(1.1)  # respect rate limit
+                except Exception as e:
+                    logger.warning(f"Auto-backfill {sym} failed: {e}")
+
     except Exception as e:
         logger.warning(f"Backfill check failed: {e}")
 
@@ -408,13 +532,14 @@ def scan_market():
                 if p is not None:
                     ml_prob = p
 
-            if sig.direction == "PUT" and ml_prob > 0.40:
-                continue
-
             strat_prob = strategy_predictor.predict(sig.strategy, latest) or 0.5
-            if strat_prob < 0.30:
+            # Strategy model outputs 0.003–0.11 due to 97% negative class imbalance.
+            # Threshold 0.02 ≈ top 50% of model outputs — blocks clearly weak setups only.
+            if strat_prob < 0.02:
                 continue
 
+            # For PUT signals, use inverted ML prob as directional confidence
+            # (high ml_prob = bullish → low PUT confidence; low ml_prob = bearish → high PUT confidence)
             directional_prob = ml_prob if sig.direction == "CALL" else (1.0 - ml_prob)
 
             flow_score = 0.5
@@ -430,7 +555,17 @@ def scan_market():
                 + regime_bonus
             )
 
-            if final_score < SCORE_THRESHOLD:
+            # Regime-specific threshold: SIDEWAYS markets produce naturally lower scores
+            # (ML less directional, no strong momentum). Trending markets stay at full threshold.
+            from strategy.regime_detector import MarketRegime
+            if regime in (MarketRegime.SIDEWAYS, MarketRegime.LOW_VOLATILITY):
+                effective_threshold = SCORE_THRESHOLD * 0.85  # ~0.51 when base is 0.60
+            elif regime in (MarketRegime.HIGH_VOLATILITY,):
+                effective_threshold = SCORE_THRESHOLD * 0.90  # ~0.54 — slightly easier in high vol
+            else:
+                effective_threshold = SCORE_THRESHOLD  # TRENDING_BULL / TRENDING_BEAR: full 0.60
+
+            if final_score < effective_threshold:
                 continue
 
             atm = round(latest.get("close", 0) / 50) * 50
@@ -446,7 +581,7 @@ def scan_market():
             else:
                 risk_label = "HIGH"
 
-            # Try to get current option LTP from tick cache for SL/target
+            # Try to get current option LTP — tick cache first, then fresh DB candle, then REST
             opt_ltp = None
             try:
                 cache_data = json.loads(open(LIVE_CACHE_FILE).read())
@@ -456,8 +591,46 @@ def scan_market():
                     opt_ltp = p
             except Exception:
                 pass
-            sl_price = round(opt_ltp * (1 - INITIAL_SL_PCT), 2) if opt_ltp else None
-            target_price = round(opt_ltp * (1 + TGT_PCT), 2) if opt_ltp else None
+
+            if not opt_ltp:
+                try:
+                    row = read_sql(
+                        "SELECT close, timestamp FROM minute_candles WHERE symbol = :sym ORDER BY timestamp DESC LIMIT 1",
+                        {"sym": opt_symbol}
+                    )
+                    if not row.empty:
+                        candle_age = (pd.Timestamp.now(tz="UTC") - pd.to_datetime(row.iloc[0]["timestamp"], utc=True)).total_seconds()
+                        if candle_age < 300:  # only use if within 5 minutes
+                            opt_ltp = float(row.iloc[0]["close"])
+                            logger.debug(f"opt_ltp from DB candle ({candle_age:.0f}s old) for {opt_symbol}: {opt_ltp}")
+                        else:
+                            logger.debug(f"DB candle too stale ({candle_age:.0f}s) for {opt_symbol}, trying REST")
+                except Exception:
+                    pass
+
+            if not opt_ltp:
+                # REST fallback — fetch latest 1-min bar directly from TrueData
+                try:
+                    from data.truedata_adapter import TrueDataAdapter
+                    _td = TrueDataAdapter()
+                    if _td.authenticate():
+                        bars = _td.fetch_last_n_bars(opt_symbol, n=1, interval="1min")
+                        if bars is not None and not bars.empty:
+                            opt_ltp = float(bars.iloc[-1]["close"])
+                            logger.info(f"opt_ltp from REST for {opt_symbol}: {opt_ltp}")
+                except Exception as e:
+                    logger.debug(f"REST price fallback failed for {opt_symbol}: {e}")
+
+            # Dynamic SL and target based on signal quality (score-tiered)
+            if final_score >= 0.75:
+                sl_pct, target_pct = 0.15, 0.70   # strong signal → larger target
+            elif final_score >= 0.65:
+                sl_pct, target_pct = 0.15, 0.55
+            else:
+                sl_pct, target_pct = 0.12, 0.40   # weaker signal → tighter SL, smaller target
+
+            sl_price = round(opt_ltp * (1 - sl_pct), 2) if opt_ltp else None
+            target_price = round(opt_ltp * (1 + target_pct), 2) if opt_ltp else None
 
             # Deduplicate: if same signal fired within cooldown, refresh its timestamp
             cooldown_key = (opt_symbol, sig.direction, sig.strategy)
@@ -471,6 +644,7 @@ def scan_market():
                         existing["ml_prob"] = round(ml_prob, 4)
                         existing["final_score"] = round(final_score, 4)
                         existing["risk_label"] = risk_label
+                        existing["lots"] = _lots_for_score(final_score)
                         if opt_ltp:
                             existing["entry_premium"] = opt_ltp
                             existing["sl_price"] = sl_price
@@ -478,6 +652,7 @@ def scan_market():
                 continue
             _suggestion_cooldown[cooldown_key] = datetime.now()
 
+            lots = _lots_for_score(final_score)
             trade = {
                 "time": datetime.now().strftime("%H:%M:%S"),
                 "symbol": opt_symbol,
@@ -486,6 +661,9 @@ def scan_market():
                 "entry_premium": opt_ltp,
                 "sl_price": sl_price,
                 "target_price": target_price,
+                "sl_pct": sl_pct,
+                "target_pct": target_pct,
+                "lots": lots,
                 "expiry": str(expiry),
                 "dte": dte,
                 "ml_prob": round(ml_prob, 4),
@@ -507,6 +685,11 @@ def scan_market():
                 f"TRADE SUGGESTION: {sig.direction} {opt_symbol} | "
                 f"ML={ml_prob:.2f} Strat={strat_prob:.2f} Score={final_score:.2f}"
             )
+
+            # Auto-trade mode: enter the position automatically without waiting for manual action
+            if auto_trade_enabled:
+                _auto_enter_position(trade, trade_mode="test")
+
             break
 
     except Exception as e:
@@ -764,9 +947,6 @@ def run_replay(replay_date: str):
                     p = predictor.predict_macro(latest)
                     if p is not None:
                         ml_prob = p
-
-                if sig.direction == "PUT" and ml_prob > 0.40:
-                    continue
 
                 strat_prob = strategy_predictor.predict(sig.strategy, latest)
                 if strat_prob is None or strat_prob < 0.05:
@@ -1100,21 +1280,44 @@ def _tick_monitor_loop():
                 continue
 
             # Read tick cache
+            cache = {}
             try:
                 mtime = os.path.getmtime(LIVE_CACHE_FILE)
-                age = time.time() - mtime
-                if age > 30:
-                    time.sleep(1)
-                    continue
-                cache = json.loads(open(LIVE_CACHE_FILE).read())
+                if time.time() - mtime <= 30:
+                    cache = json.loads(open(LIVE_CACHE_FILE).read())
             except Exception:
-                time.sleep(1)
-                continue
+                pass
 
             for pos in open_positions:
                 sym = pos["symbol"]
+                live_price = None
+
+                # 1. Try tick cache (WebSocket, most real-time)
                 if sym in cache and cache[sym].get("price", 0) > 0:
-                    _update_position_price(pos, float(cache[sym]["price"]))
+                    ts_str = cache[sym].get("ts", "")
+                    try:
+                        ts_age = (datetime.now() - datetime.fromisoformat(ts_str)).total_seconds()
+                    except Exception:
+                        ts_age = 0
+                    if ts_age < 120:  # only use if not stale
+                        live_price = float(cache[sym]["price"])
+
+                # 2. Fallback: fetch last 1-min bar via TrueData REST (rate-limited to once per 60s per symbol)
+                if live_price is None:
+                    last_rest = _tick_monitor_rest_ts.get(sym, 0)
+                    if time.time() - last_rest >= 60:
+                        try:
+                            from data.truedata_adapter import TrueDataAdapter as _TDA
+                            _td_fallback = _TDA()
+                            bars = _td_fallback.fetch_last_n_bars(sym, n=1, interval="1min")
+                            if not bars.empty:
+                                live_price = float(bars.iloc[-1]["close"])
+                                _tick_monitor_rest_ts[sym] = time.time()
+                        except Exception:
+                            pass
+
+                if live_price is not None:
+                    _update_position_price(pos, live_price)
 
         except Exception as e:
             logger.error(f"Tick monitor error: {e}")
@@ -1129,8 +1332,49 @@ def _ensure_tick_monitor():
         _tick_monitor_thread.start()
 
 
+def _cache_prices_are_fresh(max_age_secs: int = 90) -> bool:
+    """
+    Return True if the tick cache is healthy.
+    Three states:
+      - File old (>30s)  → False (no collector running)
+      - File fresh, cache empty → True (collector just started, give it grace period)
+      - File fresh, cache has entries but all stale (>max_age_secs) → False (WebSocket stalled)
+      - File fresh, cache has a recent entry → True (healthy)
+    """
+    try:
+        mtime = os.path.getmtime(LIVE_CACHE_FILE)
+        if time.time() - mtime >= 30:
+            return False  # file itself is old — no process writing it
+        cache = json.loads(open(LIVE_CACHE_FILE).read())
+        if not cache:
+            # Empty cache + fresh file = collector just started and hasn't received ticks yet.
+            # Give it up to 120s grace period before declaring it stalled.
+            return True
+        now_ts = datetime.now()
+        for sym_data in cache.values():
+            try:
+                ts = datetime.fromisoformat(sym_data.get("ts", ""))
+                if (now_ts - ts).total_seconds() < max_age_secs:
+                    return True
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return False
+
+
+def _kill_stalled_collector():
+    """Kill any running collect_ticks.py process (stalled or otherwise)."""
+    try:
+        import subprocess as sp
+        sp.run(["pkill", "-f", "collect_ticks.py"], capture_output=True)
+        time.sleep(1)
+    except Exception:
+        pass
+
+
 def _ensure_collector():
-    """Auto-start collect_ticks.py if it's market hours and not already running."""
+    """Auto-start collect_ticks.py if it's market hours and not delivering fresh prices."""
     global _collector_process
     import subprocess
 
@@ -1139,26 +1383,15 @@ def _ensure_collector():
     if now.weekday() >= 5 or not (9 <= now.hour < 16):
         return
 
-    # Check if already running (our subprocess or any existing process)
-    if _collector_process is not None and _collector_process.poll() is None:
-        return  # our subprocess is still running
+    # Price freshness is the single source of truth — check it first.
+    # A process can be "running" but have a stalled WebSocket writing stale prices.
+    if _cache_prices_are_fresh():
+        return  # collector is alive and delivering real ticks
 
-    # Check if another instance is running
-    try:
-        import subprocess as sp
-        result = sp.run(["pgrep", "-f", "collect_ticks.py"], capture_output=True, text=True)
-        if result.returncode == 0 and result.stdout.strip():
-            return  # another instance running
-    except Exception:
-        pass
-
-    # Check if tick cache is fresh (means collector is likely running)
-    try:
-        mtime = os.path.getmtime(LIVE_CACHE_FILE)
-        if time.time() - mtime < 30:
-            return
-    except Exception:
-        pass
+    # Prices are stale — kill whatever is running and restart fresh
+    logger.warning("Tick cache prices are stale. Killing any existing collector and restarting.")
+    _kill_stalled_collector()
+    _collector_process = None
 
     # Start collector
     project_root = Path(__file__).resolve().parent.parent
@@ -1195,14 +1428,16 @@ def api_paper_enter():
 
     # If no premium provided, try multiple resolution strategies
     if not entry_premium:
-        # 1. Try DB candle for the option symbol
+        # 1. Try DB candle — only if fresh (< 5 minutes old); stale prices cause instant SL hits
         try:
             row = read_sql(
-                "SELECT close FROM minute_candles WHERE symbol = :sym ORDER BY timestamp DESC LIMIT 1",
+                "SELECT close, timestamp FROM minute_candles WHERE symbol = :sym ORDER BY timestamp DESC LIMIT 1",
                 {"sym": symbol}
             )
             if not row.empty:
-                entry_premium = float(row.iloc[0]["close"])
+                candle_age = (pd.Timestamp.now(tz="UTC") - pd.to_datetime(row.iloc[0]["timestamp"], utc=True)).total_seconds()
+                if candle_age < 300:
+                    entry_premium = float(row.iloc[0]["close"])
         except Exception:
             pass
 
@@ -1241,7 +1476,19 @@ def api_paper_enter():
         return jsonify({"error": "Could not determine entry premium — no DB candle, no live data, and strike parse failed"}), 400
 
     ep = round(float(entry_premium), 2)
-    initial_sl = round(ep * (1 - INITIAL_SL_PCT), 2)
+    # Dynamic SL/target: use values from suggestion if provided, else derive from score
+    sl_pct = body.get("sl_pct") or (
+        0.15 if final_score >= 0.75 else
+        0.15 if final_score >= 0.65 else
+        0.12
+    )
+    target_pct = body.get("target_pct") or (
+        0.70 if final_score >= 0.75 else
+        0.55 if final_score >= 0.65 else
+        0.40
+    )
+    initial_sl = round(ep * (1 - sl_pct), 2)
+    lots = _lots_for_score(final_score)
     position = {
         "id": int(datetime.now().timestamp() * 1000),
         "entry_time": datetime.now().strftime("%H:%M:%S"),
@@ -1251,10 +1498,10 @@ def api_paper_enter():
         "entry_premium": ep,
         "sl": initial_sl,
         "initial_sl": initial_sl,
-        "target": round(ep * (1 + TGT_PCT), 2),
+        "target": round(ep * (1 + target_pct), 2),
         "max_premium": ep,       # tracks highest premium seen (for trailing SL)
         "trailing_active": False,  # becomes True once profit > TRAIL_ACTIVATE_PCT
-        "lot_size": LOT_SIZE,
+        "lot_size": LOT_SIZE * lots,
         "ml_prob": ml_prob,
         "final_score": final_score,
         "index_price": index_price,
@@ -1269,7 +1516,7 @@ def api_paper_enter():
     }
     position["mode"] = trade_mode
     positions.append(position)
-    logger.info(f"PAPER ENTER [{trade_mode}]: {direction} {symbol} @ ₹{ep} | SL={position['sl']} TGT={position['target']}")
+    logger.info(f"PAPER ENTER [{trade_mode}]: {direction} {symbol} @ ₹{ep} | SL={position['sl']} TGT={position['target']} | {lots} lot(s) (score={final_score:.3f})")
 
     # Ensure tick monitor and data collector are running
     _ensure_tick_monitor()
@@ -1435,6 +1682,7 @@ def api_stream():
                         "last_scan": state.get("last_scan"),
                         "scan_count": state.get("scan_count", 0),
                         "trade_suggestions": state.get("trade_suggestions", []),
+                        "auto_trade_enabled": state.get("auto_trade_enabled", True),
                     },
                     "positions_by_mode": paper_positions_by_mode,
                     "tick_cache": cache,
@@ -1500,6 +1748,23 @@ def api_system_stop():
     state["status"] = "stopped"
     logger.info("Scanner STOPPED via API")
     return jsonify({"scanner_enabled": False})
+
+
+@app.route("/api/auto_trade", methods=["GET"])
+def api_get_auto_trade():
+    """Return current auto-trade mode."""
+    return jsonify({"auto_trade_enabled": auto_trade_enabled})
+
+
+@app.route("/api/auto_trade", methods=["POST"])
+def api_set_auto_trade():
+    """Enable or disable auto-trade mode. Body: {\"enabled\": true|false}"""
+    global auto_trade_enabled
+    body = request.get_json(force=True)
+    auto_trade_enabled = bool(body.get("enabled", True))
+    state["auto_trade_enabled"] = auto_trade_enabled
+    logger.info(f"Auto-trade {'ENABLED' if auto_trade_enabled else 'DISABLED'}")
+    return jsonify({"auto_trade_enabled": auto_trade_enabled})
 
 
 # ── New API endpoints for Next.js dashboard ────────────────────────────────

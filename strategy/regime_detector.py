@@ -164,10 +164,14 @@ class RegimeDetector:
 # ── Strategy Regime Mapping ───────────────────────────────────────────────────
 
 REGIME_STRATEGIES = {
+    # Trending regimes: primary directional strategy gets the bonus
     MarketRegime.TRENDING_BULL: ["vwap_momentum_breakout"],
     MarketRegime.TRENDING_BEAR: ["bearish_momentum"],
-    MarketRegime.SIDEWAYS: ["mean_reversion"],
-    MarketRegime.HIGH_VOLATILITY: ["mean_reversion"],
+    # Sideways: mean_reversion is primary, but momentum breakouts/breakdowns are valid too
+    # (NIFTY can grind down from a sideways range — bearish_momentum is a real sideways setup)
+    MarketRegime.SIDEWAYS: ["mean_reversion", "bearish_momentum", "vwap_momentum_breakout"],
+    # High-vol: both reversion and momentum are valid (fast moves in both directions)
+    MarketRegime.HIGH_VOLATILITY: ["mean_reversion", "bearish_momentum", "vwap_momentum_breakout"],
     MarketRegime.LOW_VOLATILITY: ["vwap_momentum_breakout"],
     MarketRegime.UNKNOWN: ["vwap_momentum_breakout", "bearish_momentum", "mean_reversion"],
 }

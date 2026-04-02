@@ -77,6 +77,9 @@ running = True
 live_price_cache: dict = {}
 LIVE_CACHE_FILE = Path("/tmp/td_live_prices.json")
 
+# Watchdog: track when we last received a real tick (not a heartbeat)
+last_tick_received_time: float = time.time()
+
 
 def signal_handler(signum, frame):
     global running
@@ -218,7 +221,8 @@ def _flush_price_cache():
 
 def on_tick(tick: dict):
     """Process each incoming tick: buffer for candle aggregation."""
-    global candle_buffer, last_minute, live_price_cache
+    global candle_buffer, last_minute, live_price_cache, last_tick_received_time
+    last_tick_received_time = time.time()
 
     symbol = tick.get("symbol", "")
     ts = tick.get("timestamp", datetime.now())
@@ -233,9 +237,11 @@ def on_tick(tick: dict):
         symbol = tick["symbol"]
 
     # Update live price cache immediately (cache both original and remapped names)
+    # Use wall-clock time as "ts" so Flask's freshness check sees when WE received the tick,
+    # not the market timestamp (which can be hours old for illiquid options snapshots).
     price = tick.get("price", 0)
     if price and price > 0:
-        entry = {"price": price, "ts": ts.isoformat() if hasattr(ts, 'isoformat') else str(ts)}
+        entry = {"price": price, "ts": datetime.now().isoformat()}
         live_price_cache[symbol] = entry
         if original_symbol != symbol:
             live_price_cache[original_symbol] = entry
@@ -277,7 +283,7 @@ def flush_remaining_candles():
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    global td, collector, running
+    global td, collector, running, last_tick_received_time
 
     parser = argparse.ArgumentParser(description="Automated tick collector")
     parser.add_argument("--test", action="store_true", help="Test connection only")
@@ -392,9 +398,53 @@ def main():
     # ── Main loop: wait until market close ───────────────────────────────
     close_time = market_close_time() + timedelta(minutes=1)  # 1 min buffer
     tick_count_last = 0
+    WATCHDOG_TIMEOUT = 60  # seconds — force reconnect if no real tick received
+
+    # Track subscribed ATM for dynamic re-subscription when NIFTY drifts
+    subscribed_atm = round(current_price / 50) * 50
+    subscribed_symbols_set = set(subscribe_symbols)
+    last_atm_check = time.time()
+    ATM_RECHECK_SECS = 120  # check every 2 minutes
 
     while running and datetime.now() < close_time:
         time.sleep(30)
+
+        # ── Dynamic ATM re-subscription ───────────────────────────────────
+        # If NIFTY moves 100+ pts (2 strikes) from the subscribed ATM, subscribe
+        # to the new ATM range so open positions always have live tick prices.
+        if time.time() - last_atm_check >= ATM_RECHECK_SECS:
+            live_price = live_price_cache.get("NIFTY-I", {}).get("price", 0)
+            if live_price > 0:
+                new_atm = round(live_price / 50) * 50
+                if abs(new_atm - subscribed_atm) >= 100:
+                    new_opt_symbols = get_option_symbols_for_today(live_price)
+                    to_add = [s for s in new_opt_symbols if s not in subscribed_symbols_set]
+                    if to_add:
+                        logger.info(
+                            f"NIFTY ATM drifted {subscribed_atm} → {new_atm} "
+                            f"(live={live_price:.1f}). Adding {len(to_add)} new symbols: {to_add}"
+                        )
+                        td.ws_subscribe(to_add)
+                        subscribed_symbols_set.update(to_add)
+                        subscribed_atm = new_atm
+            last_atm_check = time.time()
+
+        # ── Watchdog: detect silent WebSocket stall ───────────────────────
+        # The _stream_loop in truedata_adapter handles auto-reconnect on exceptions.
+        # We just need to force-close the socket; _stream_loop will detect the error
+        # and reconnect + re-subscribe automatically.
+        secs_since_tick = time.time() - last_tick_received_time
+        if secs_since_tick > WATCHDOG_TIMEOUT:
+            logger.warning(
+                f"No ticks for {secs_since_tick:.0f}s — force-closing socket; "
+                "stream loop will auto-reconnect."
+            )
+            try:
+                if td._ws:
+                    td._ws.close()
+            except Exception as e:
+                logger.debug(f"Watchdog socket close error: {e}")
+            last_tick_received_time = time.time()  # reset to avoid tight retry loop
 
         # Periodic status
         current_count = len(collector._buffer)
@@ -402,6 +452,7 @@ def main():
             logger.info(
                 f"Status: buffer={current_count} ticks, "
                 f"candle_symbols={len(candle_buffer)}, "
+                f"secs_since_last_tick={secs_since_tick:.0f}, "
                 f"time={datetime.now().strftime('%H:%M:%S')}"
             )
         tick_count_last = current_count
