@@ -9,7 +9,7 @@ Retro terminal-style monitoring dashboard for the AI Trader NSE F&O system.
 ## Prerequisites
 
 - Node.js 18+
-- Flask API running on `http://localhost:5050` (see `../frontend/app.py`)
+- Flask API running on `http://localhost:5050` (see `../backend/app.py`)
 
 ## Setup
 
@@ -27,7 +27,7 @@ npm run start     # Serve production build
 
 > **The Flask API must be running first.** Start it from the project root:
 > ```bash
-> python frontend/app.py
+> python backend/app.py
 > ```
 
 ---

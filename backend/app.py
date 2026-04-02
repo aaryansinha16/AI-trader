@@ -9,7 +9,7 @@ Features:
   - Trade log with P&L
   - System status (models loaded, DB connected, etc.)
 
-Run: python frontend/app.py
+Run: python backend/app.py
 Open: http://localhost:5050
 """
 
@@ -76,6 +76,45 @@ SUGGESTION_COOLDOWN_SECS = 300  # 5 minutes
 paper_positions_by_mode: dict = {"test": [], "live": []}
 paper_positions: list = paper_positions_by_mode["test"]  # default alias for tick monitor
 
+# Closed live trade history — persisted to disk so it survives Flask restarts
+_closed_trades_by_mode: dict = {"test": [], "live": []}
+_PAPER_TRADES_DIR = Path("paper_trades")
+
+
+def _paper_trades_file(mode: str) -> Path:
+    return _PAPER_TRADES_DIR / f"trades_{mode}.jsonl"
+
+
+def _load_paper_trade_history():
+    """Load closed paper trade history from JSONL files on startup."""
+    global _closed_trades_by_mode
+    _PAPER_TRADES_DIR.mkdir(exist_ok=True)
+    for mode in ("test", "live"):
+        fpath = _paper_trades_file(mode)
+        if fpath.exists():
+            try:
+                trades = []
+                for line in fpath.read_text().splitlines():
+                    line = line.strip()
+                    if line:
+                        trades.append(json.loads(line))
+                _closed_trades_by_mode[mode] = trades
+                logger.info(f"Loaded {len(trades)} closed {mode} paper trades from history")
+            except Exception as e:
+                logger.warning(f"Failed to load paper trade history ({mode}): {e}")
+
+
+def _persist_closed_trade(pos: dict):
+    """Append a closed trade (with journey) to the JSONL file for its mode."""
+    mode = pos.get("mode", "test")
+    _closed_trades_by_mode.setdefault(mode, []).append(pos)
+    fpath = _paper_trades_file(mode)
+    try:
+        with open(fpath, "a") as f:
+            f.write(json.dumps(pos, default=str) + "\n")
+    except Exception as e:
+        logger.warning(f"Failed to persist trade {pos.get('id')}: {e}")
+
 
 def _get_mode_positions(mode: str = None) -> list:
     """Return positions list for given mode (from request arg or explicit)."""
@@ -84,6 +123,11 @@ def _get_mode_positions(mode: str = None) -> list:
     if mode not in paper_positions_by_mode:
         mode = "test"
     return paper_positions_by_mode[mode]
+
+
+BREAKEVEN_AFTER_MIN   = 15    # minutes in any profit → move SL to entry
+BREAKEVEN_MIN_PROFIT  = 0.02  # must be at least +2% in profit to trigger BE
+REGIME_CHECK_INTERVAL = 30    # seconds between regime checks per position
 
 
 def _auto_enter_position(trade: dict, trade_mode: str = "test"):
@@ -106,9 +150,11 @@ def _auto_enter_position(trade: dict, trade_mode: str = "test"):
     final_score = trade.get("final_score", 0.5)
     initial_sl = round(ep * (1 - sl_pct), 2)
     lots = _lots_for_score(final_score)
+    now_dt = datetime.now()
     position = {
-        "id": int(datetime.now().timestamp() * 1000),
-        "entry_time": datetime.now().strftime("%H:%M:%S"),
+        "id": int(now_dt.timestamp() * 1000),
+        "entry_time": now_dt.strftime("%H:%M:%S"),
+        "entry_time_dt": now_dt.isoformat(),   # full datetime for BE timer
         "symbol": trade["symbol"],
         "direction": trade["direction"],
         "strategy": trade.get("strategy", ""),
@@ -118,6 +164,9 @@ def _auto_enter_position(trade: dict, trade_mode: str = "test"):
         "target": round(ep * (1 + target_pct), 2),
         "max_premium": ep,
         "trailing_active": False,
+        "breakeven_locked": False,             # True once SL moved to entry
+        "first_profit_time": None,             # iso ts when trade first went green
+        "last_regime_check": now_dt.isoformat(),
         "lot_size": LOT_SIZE * lots,
         "ml_prob": trade.get("ml_prob", 0.5),
         "final_score": final_score,
@@ -132,6 +181,7 @@ def _auto_enter_position(trade: dict, trade_mode: str = "test"):
         "exit_reason": None,
         "mode": trade_mode,
         "auto_entered": True,
+        "journey": [],   # [{ts, option_price, nifty_price}] — populated by tick monitor
     }
     positions.append(position)
     logger.info(
@@ -353,6 +403,7 @@ def initialize():
     state["strategy_models_loaded"] = strategy_predictor.available_strategies
 
     state["status"] = "ready"
+    _load_paper_trade_history()
     logger.info("Dashboard initialized.")
 
 
@@ -546,6 +597,17 @@ def scan_market():
             pcr = latest.get("pcr")
             if pcr and not np.isnan(pcr):
                 flow_score = min(0.3 * (pcr > 1.2) + 0.2, 1.0)
+            else:
+                # OBV slope + MFI direction-aware fallback when PCR unavailable
+                obv_slope = latest.get("obv_slope", 0) or 0
+                mfi = latest.get("mfi", 50) or 50
+                if sig.direction == "CALL":
+                    obv_contrib = 0.15 if obv_slope > 0 else (-0.10 if obv_slope < 0 else 0.0)
+                    mfi_contrib = 0.15 if mfi > 60 else (-0.10 if mfi < 40 else 0.0)
+                else:  # PUT
+                    obv_contrib = 0.15 if obv_slope < 0 else (-0.10 if obv_slope > 0 else 0.0)
+                    mfi_contrib = 0.15 if mfi < 40 else (-0.10 if mfi > 60 else 0.0)
+                flow_score = max(0.20, min(1.0, 0.50 + obv_contrib + mfi_contrib))
 
             regime_bonus = 0.05 if regime_strategies and sig.strategy in regime_strategies else 0.0
             final_score = (
@@ -565,6 +627,28 @@ def scan_market():
             else:
                 effective_threshold = SCORE_THRESHOLD  # TRENDING_BULL / TRENDING_BEAR: full 0.60
 
+            # Unified quality gate: both CALL and PUT use put_score_threshold from MEDIUM profile
+            # (backtested: CALL WR 45% vs PUT 60% — CALLs need equal selectivity as PUTs)
+            from config.risk_profiles import get_risk_profile as _get_rp, RiskLevel as _RL
+            _med_profile = _get_rp(_RL.MEDIUM)
+            effective_threshold = max(effective_threshold, _med_profile.put_score_threshold)
+
+            # Strategy-specific gates (evidence from backtest with real slippage)
+            if sig.strategy == "mean_reversion":
+                # Only fire in SIDEWAYS/LOW_VOLATILITY — in trending markets it fights the trend
+                # (scores 0.90-0.94 but still lost on trending days in backtest)
+                if regime not in (MarketRegime.SIDEWAYS, MarketRegime.LOW_VOLATILITY):
+                    continue
+                # ML must confirm direction: directional_prob < 0.40 = model actively opposes signal
+                if directional_prob < 0.40:
+                    continue
+                effective_threshold = max(effective_threshold, 0.80)
+            elif sig.strategy == "vwap_momentum_breakout":
+                # Only in bullish trending regimes (CALL breakout strategy)
+                if regime not in (MarketRegime.TRENDING_BULL, MarketRegime.LOW_VOLATILITY):
+                    continue
+                effective_threshold = max(effective_threshold, 0.65)
+
             if final_score < effective_threshold:
                 continue
 
@@ -581,12 +665,17 @@ def scan_market():
             else:
                 risk_label = "HIGH"
 
-            # Try to get current option LTP — tick cache first, then fresh DB candle, then REST
+            # Try to get current option price — tick cache first, then DB candle, then REST
+            # Use ASK price for entry (we're the buyer, we pay the ask).
+            # Fall back to LTP if bid/ask not available.
             opt_ltp = None
             try:
                 cache_data = json.loads(open(LIVE_CACHE_FILE).read())
                 tick_entry = cache_data.get(opt_symbol, {})
-                p = float(tick_entry.get("price", 0))
+                # Prefer ask price for entry; fall back to last traded price
+                ask = float(tick_entry.get("ask", 0) or 0)
+                ltp = float(tick_entry.get("price", 0) or 0)
+                p = ask if ask > 0 else ltp
                 if p > 0:
                     opt_ltp = p
             except Exception:
@@ -622,12 +711,14 @@ def scan_market():
                     logger.debug(f"REST price fallback failed for {opt_symbol}: {e}")
 
             # Dynamic SL and target based on signal quality (score-tiered)
+            # Targets are a ceiling — trailing SL (activates at +10%, ratchets up) is what
+            # captures most profit in practice. Hard target only fires on sharp one-way moves.
             if final_score >= 0.75:
-                sl_pct, target_pct = 0.15, 0.70   # strong signal → larger target
+                sl_pct, target_pct = 0.15, 0.55   # was 70% — most moves exhaust before that
             elif final_score >= 0.65:
-                sl_pct, target_pct = 0.15, 0.55
+                sl_pct, target_pct = 0.15, 0.45
             else:
-                sl_pct, target_pct = 0.12, 0.40   # weaker signal → tighter SL, smaller target
+                sl_pct, target_pct = 0.12, 0.35
 
             sl_price = round(opt_ltp * (1 - sl_pct), 2) if opt_ltp else None
             target_price = round(opt_ltp * (1 + target_pct), 2) if opt_ltp else None
@@ -914,7 +1005,7 @@ def run_replay(replay_date: str):
             ).tail(500)
 
             # Signal + ML if not in trade
-            if not in_trade and daily_trades < 5 and len(candle_buffer) >= 250:
+            if not in_trade and len(candle_buffer) >= 250:  # daily_trades < 5 TEMP: disabled to collect more training data
                 try:
                     featured = compute_all_macro_indicators(candle_buffer.tail(300).copy())
                     if featured.empty:
@@ -1215,10 +1306,39 @@ def _update_position_price(pos: dict, live_prem: float):
         pos["trailing_active"] = False
     if "initial_sl" not in pos:
         pos["initial_sl"] = pos["sl"]
+    if "breakeven_locked" not in pos:
+        pos["breakeven_locked"] = False
+    if "first_profit_time" not in pos:
+        pos["first_profit_time"] = None
+
+    now = datetime.now()
 
     # Update max premium seen
     if live_prem > pos["max_premium"]:
         pos["max_premium"] = round(live_prem, 2)
+
+    current_profit_pct = (live_prem - ep) / ep
+
+    # --- Breakeven protection ---
+    # Track when trade first goes into profit (≥ BREAKEVEN_MIN_PROFIT)
+    if current_profit_pct >= BREAKEVEN_MIN_PROFIT and pos["first_profit_time"] is None:
+        pos["first_profit_time"] = now.isoformat()
+
+    # After BREAKEVEN_AFTER_MIN minutes in profit, lock SL at entry (worst case: scratch trade)
+    if (not pos["breakeven_locked"]
+            and pos["first_profit_time"] is not None
+            and current_profit_pct >= 0):   # still in profit when timer fires
+        try:
+            first_profit_dt = datetime.fromisoformat(pos["first_profit_time"])
+            mins_in_profit = (now - first_profit_dt).total_seconds() / 60
+            if mins_in_profit >= BREAKEVEN_AFTER_MIN:
+                be_sl = round(ep * 1.001, 2)  # entry + tiny buffer for slippage
+                if be_sl > pos["sl"]:
+                    pos["sl"] = be_sl
+                    pos["breakeven_locked"] = True
+                    logger.info(f"BE LOCK {pos['symbol']}: SL moved to ₹{be_sl} (entry+0.1%) after {mins_in_profit:.1f}min in profit")
+        except Exception:
+            pass
 
     # Activate trailing once profit exceeds threshold
     profit_pct = (pos["max_premium"] - ep) / ep
@@ -1245,6 +1365,7 @@ def _update_position_price(pos: dict, live_prem: float):
             "exit_reason": "TRAILING_SL" if pos["trailing_active"] else "SL_HIT",
         })
         logger.info(f"PAPER AUTO-EXIT {pos['exit_reason']}: {pos['symbol']} @ ₹{live_prem} | SL was ₹{pos['sl']} | PnL=₹{pnl}")
+        _persist_closed_trade(pos)
     elif live_prem >= pos["target"]:
         pnl = round((live_prem - ep) * pos["lot_size"] - COMMISSION, 2)
         pos.update({
@@ -1256,6 +1377,7 @@ def _update_position_price(pos: dict, live_prem: float):
             "exit_reason": "TARGET_HIT",
         })
         logger.info(f"PAPER AUTO-EXIT TGT: {pos['symbol']} @ ₹{live_prem} | PnL=₹{pnl}")
+        _persist_closed_trade(pos)
 
 
 def _tick_monitor_loop():
@@ -1300,7 +1422,10 @@ def _tick_monitor_loop():
                     except Exception:
                         ts_age = 0
                     if ts_age < 120:  # only use if not stale
-                        live_price = float(cache[sym]["price"])
+                        # Use BID price for exit/SL monitoring — we receive the bid when selling
+                        bid = float(cache[sym].get("bid", 0) or 0)
+                        ltp = float(cache[sym]["price"])
+                        live_price = bid if bid > 0 else ltp
 
                 # 2. Fallback: fetch last 1-min bar via TrueData REST (rate-limited to once per 60s per symbol)
                 if live_price is None:
@@ -1318,6 +1443,53 @@ def _tick_monitor_loop():
 
                 if live_price is not None:
                     _update_position_price(pos, live_price)
+
+                # --- Journey tracking: record every 5s ---
+                if live_price is not None and pos["status"] == "OPEN":
+                    journey = pos.setdefault("journey", [])
+                    last_ts = journey[-1]["ts"] if journey else None
+                    nifty_price = float(cache.get("NIFTY-I", {}).get("price", 0) or 0)
+                    now_ts = datetime.now().isoformat()
+                    if last_ts is None or (datetime.now() - datetime.fromisoformat(last_ts)).total_seconds() >= 5:
+                        journey.append({
+                            "ts": now_ts,
+                            "option_price": round(live_price, 2),
+                            "nifty_price": round(nifty_price, 2),
+                            "sl": round(pos["sl"], 2),
+                            "unrealised_pnl": pos.get("unrealised_pnl", 0),
+                        })
+                        # Cap at 500 points (~40 min at 5s interval) to avoid unbounded memory
+                        if len(journey) > 500:
+                            journey.pop(0)
+
+                # --- Regime-aware SL tightening (every 30s per position) ---
+                if live_price is not None and pos["status"] == "OPEN":
+                    try:
+                        last_check = datetime.fromisoformat(pos.get("last_regime_check", "2000-01-01"))
+                        if (datetime.now() - last_check).total_seconds() >= REGIME_CHECK_INTERVAL:
+                            pos["last_regime_check"] = datetime.now().isoformat()
+                            nifty_bid = float(cache.get("NIFTY-I", {}).get("bid", 0) or
+                                              cache.get("NIFTY-I", {}).get("price", 0) or 0)
+                            if nifty_bid > 0 and pos.get("index_price", 0) > 0:
+                                nifty_move_pct = (nifty_bid - pos["index_price"]) / pos["index_price"]
+                                direction = pos["direction"]
+                                # Regime flip: NIFTY has moved >0.3% AGAINST position direction
+                                regime_flipped = (
+                                    (direction == "CALL" and nifty_move_pct < -0.003) or
+                                    (direction == "PUT"  and nifty_move_pct >  0.003)
+                                )
+                                if regime_flipped and live_price > pos["sl"]:
+                                    # Tighten SL to current bid × 0.97 (3% below current price)
+                                    # Only tighten, never loosen
+                                    tight_sl = round(live_price * 0.97, 2)
+                                    if tight_sl > pos["sl"]:
+                                        pos["sl"] = tight_sl
+                                        logger.info(
+                                            f"REGIME TIGHTEN {pos['symbol']}: SL→₹{tight_sl} "
+                                            f"(NIFTY moved {nifty_move_pct:+.2%} against {direction})"
+                                        )
+                    except Exception:
+                        pass
 
         except Exception as e:
             logger.error(f"Tick monitor error: {e}")
@@ -1547,6 +1719,7 @@ def api_paper_exit():
         "exit_reason": "MANUAL",
     })
     logger.info(f"PAPER EXIT (manual): {pos['symbol']} @ ₹{exit_premium} | PnL=₹{pnl}")
+    _persist_closed_trade(pos)
     return jsonify(pos)
 
 
@@ -1627,6 +1800,70 @@ def api_paper_positions():
         "total_closed_pnl": round(total_closed_pnl, 2),
         "total_pnl": round(total_open_pnl + total_closed_pnl, 2),
     })
+
+
+@app.route("/api/paper/journey/<int:position_id>")
+def api_paper_journey(position_id):
+    """Return the price journey for a specific position (open, closed this session, or historical)."""
+    # Search in-memory (open + closed this session)
+    all_positions = []
+    for mode_positions in paper_positions_by_mode.values():
+        all_positions.extend(mode_positions)
+    pos = next((p for p in all_positions if p.get("id") == position_id), None)
+    # Fall back to persisted closed trade history (survives Flask restarts)
+    if pos is None:
+        for mode_trades in _closed_trades_by_mode.values():
+            pos = next((p for p in mode_trades if p.get("id") == position_id), None)
+            if pos:
+                break
+    if pos is None:
+        return jsonify({"error": "Position not found"}), 404
+    return jsonify({
+        "id": position_id,
+        "symbol": pos["symbol"],
+        "direction": pos["direction"],
+        "entry_premium": pos["entry_premium"],
+        "entry_time": pos["entry_time"],
+        "sl": pos["sl"],
+        "initial_sl": pos.get("initial_sl"),
+        "target": pos["target"],
+        "status": pos["status"],
+        "journey": pos.get("journey", []),
+    })
+
+
+@app.route("/api/paper/trades")
+def api_paper_trades_history():
+    """Return all closed live paper trades (persisted across restarts).
+
+    Query params:
+      mode=test|live  (default: test)
+      date=YYYY-MM-DD (optional, filter by entry date)
+    """
+    mode = request.args.get("mode", "test")
+    date_filter = request.args.get("date")
+    trades = list(_closed_trades_by_mode.get(mode, []))
+    if date_filter:
+        trades = [t for t in trades if (t.get("entry_time_dt") or "").startswith(date_filter)]
+    # Newest first
+    return jsonify(list(reversed(trades)))
+
+
+@app.route("/api/backtest/journey/<risk>/<int:trade_idx>")
+def api_backtest_journey(risk, trade_idx):
+    """Return the per-minute journey for a specific backtest trade."""
+    _project_root = Path(__file__).resolve().parent.parent
+    path = _project_root / "backtest_results" / f"journeys_{risk}_risk.json"
+    if not path.exists():
+        return jsonify({"error": "No journey data — re-run the backtest to generate it"}), 404
+    try:
+        journeys = json.loads(path.read_text())
+        journey = journeys.get(str(trade_idx))
+        if journey is None:
+            return jsonify({"error": f"No journey for trade index {trade_idx}"}), 404
+        return jsonify({"trade_idx": trade_idx, "journey": journey})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/live/prices")

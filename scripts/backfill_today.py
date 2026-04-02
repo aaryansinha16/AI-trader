@@ -64,7 +64,15 @@ def backfill_today():
         print(f"  Current NIFTY: {current_price:.1f}, ATM: {atm}")
 
         from backtest.option_resolver import get_nearest_expiry, build_option_symbol
+        from datetime import timedelta
         expiry = get_nearest_expiry(today)
+        # If nearest expiry is in the past (expired contract), fall forward to next Tuesday
+        if expiry and expiry < today:
+            days_ahead = 1 - today.weekday()  # Tuesday = 1
+            if days_ahead <= 0:
+                days_ahead += 7
+            expiry = today + timedelta(days=days_ahead)
+            print(f"  Expiry was expired ({expiry - timedelta(days=days_ahead)}), using next Tuesday: {expiry}")
         if expiry:
             print(f"  Nearest expiry: {expiry}")
             symbols = []

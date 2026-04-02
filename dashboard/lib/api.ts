@@ -10,6 +10,7 @@ export interface StreamPayload {
     last_scan: string | null;
     scan_count: number;
     trade_suggestions: TradeSuggestion[];
+    auto_trade_enabled?: boolean;
   };
   positions_by_mode: { test: PaperPosition[]; live: PaperPosition[] };
   tick_cache: Record<string, { price: number; ts: string }>;
@@ -100,6 +101,45 @@ export interface Trade {
   final_score: number;
   regime: string;
   index_price: number;
+}
+
+/** A closed live paper trade (persisted across Flask restarts). */
+export interface LiveTrade {
+  id: number;
+  entry_time: string;         // HH:MM:SS
+  entry_time_dt: string;      // full ISO datetime
+  exit_time: string | null;
+  symbol: string;
+  direction: "CALL" | "PUT";
+  strategy: string;
+  entry_premium: number;
+  exit_premium: number | null;
+  current_premium: number;
+  sl: number;
+  initial_sl: number;
+  target: number;
+  lot_size: number;
+  ml_prob: number;
+  final_score: number;
+  realised_pnl: number | null;
+  exit_reason: string | null;
+  status: "OPEN" | "CLOSED";
+  mode: string;
+  regime?: string;
+  index_price: number;
+  journey: JourneyPoint[];
+  breakeven_locked?: boolean;
+  trailing_active?: boolean;
+}
+
+export interface JourneyPoint {
+  ts: string;
+  option_price?: number;   // live trades use option_price
+  premium?: number;        // backtest uses premium
+  nifty_price: number;
+  sl: number;
+  unrealised_pnl?: number;
+  bars_held?: number;
 }
 
 export interface BacktestProfile {
