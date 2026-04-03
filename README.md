@@ -50,6 +50,51 @@ This is a **complete algorithmic trading research platform** that covers the ful
 
 ---
 
+## Screenshots
+
+### Dashboard — Equity Curve & Risk Profile Comparison
+![Dashboard](screenshots/Dashboard.png)
+
+### Live Trading — Suggestions, Auto-Execution & Open Positions
+![Live Trading](screenshots/LiveTrade_suggestions+execution.png)
+
+### Backtest — Runner, Risk Profiles & Equity Curve
+![Backtest Main](screenshots/Backtest-mainsection.png)
+
+### Backtest — Trade Records
+![Backtest Trades](screenshots/Backtest-trades-records.png)
+
+### Charts — NIFTY Candles & Live Option Chain
+![Option Chain](screenshots/Charts_optionChain.png)
+
+### Charts — Option Premium Tick Chart & Backtest Analytics
+![Premium Chart](screenshots/Charts-option-premium-chart.png)
+
+### Trade History — Stats, Strategy Breakdown & P&L Chart
+![Trade History](screenshots/TradeHistory-mainsection.png)
+
+### Trade History — Full Trade List with Inline Journey Chart
+![Trade List](screenshots/Tradehistory-tradelist.png)
+
+### Trade Journey — Option Premium Trajectory per Trade
+![Trade Journey](screenshots/Trade-journey.png)
+
+### AI Models — RL Agent, Macro Model, Strategy Models & Kelly Sizer
+![AI Models](screenshots/Ai-models.png)
+
+<details>
+<summary>More UI Screenshots</summary>
+
+#### Custom Date Picker Calendar
+![Custom Calendar](screenshots/Custom-calendar.png)
+
+#### System Controls — TEST / LIVE Mode Toggle
+![System Controls](screenshots/System%20Controls.png)
+
+</details>
+
+---
+
 ## System Architecture
 
 ```
@@ -137,7 +182,8 @@ This is a **complete algorithmic trading research platform** that covers the ful
 │              + regime_bonus                                             │
 │                                                                         │
 │  directional_prob = ML_prob (CALL) or 1 − ML_prob (PUT)                │
-│  flow_score = PCR-based: 0.5 default; boosts on PCR > 1.2              │
+│  flow_score = PCR-based when available; OBV slope + MFI direction      │
+│               fallback when PCR is unavailable (range: 0.20–1.0)       │
 │  regime_bonus = +0.05 if strategy matches current regime               │
 └────────────────────────────┬────────────────────────────────────────────┘
                              ↓
@@ -145,11 +191,10 @@ This is a **complete algorithmic trading research platform** that covers the ful
 │  POSITION MANAGEMENT (backend/app.py: _tick_monitor_loop)             │
 │  Runs every 1 second from live price cache                             │
 │                                                                         │
-│  Kelly + Regime Lot Sizing:                                            │
-│  · Kelly fraction from rolling 20-trade win rate + avg W/L ratios      │
-│  · Scaled by regime multiplier (0.25x HIGH_VOL → 1.25x TRENDING)      │
-│  · Bonus +1 lot for signals with score ≥ 0.70                         │
-│  · Capped at 5 lots maximum                                            │
+│  Score-Tiered Lot Sizing (aligned with live backend):                  │
+│  · score 0.60–0.70 → 1 lot  (65 units)                                │
+│  · score 0.70–0.80 → 2 lots (130 units)                               │
+│  · score ≥ 0.80   → 3 lots (195 units)                                │
 │                                                                         │
 │  Dynamic SL/Target (ATR + score):                                      │
 │  · SL: 12%–22% range scaled by ATR percentile + signal score           │
@@ -367,10 +412,11 @@ Trained on **actual trade outcomes** (WIN/LOSS) from backtest CSVs — not synth
 
 | Model | Training Samples | Win Rate in Data | Notes |
 |---|---|---|---|
-| `bearish_momentum` | 38 | 76% | Primary strategy; PUT signals |
+| `bearish_momentum` | 41 | 78% | Primary strategy; PUT signals |
+| `vwap_momentum_breakout` | 15 | 71% | CALL breakout; TRENDING_BULL regime only |
 | `mean_reversion` | <15 | — | Skipped until more trades accumulated |
 
-> These models need 15+ samples per strategy to train. Run more backtests → more outcome data → better discrimination.
+> These models need 15+ samples per strategy to train. AUC is currently ~0.50 (too few samples for discrimination). Run more backtests across more dates → more outcome data → models start to add signal filtering value.
 
 ### RL Exit Agent — `models/saved/rl_exit_agent.pkl`
 
@@ -379,9 +425,9 @@ Trained on **actual trade outcomes** (WIN/LOSS) from backtest CSVs — not synth
 | Algorithm | Tabular Q-learning (dict-based Q-table) |
 | State space | 8 features: pnl_pct, bars_held_norm, momentum, volatility, dist_to_sl, dist_to_tgt, trailing_active, peak_gain |
 | Action space | HOLD / EXIT / TIGHTEN |
-| Training data | 79 premium trajectories from all backtest journeys (high/medium/low) |
-| Episodes | 254,000+ |
-| Policy | 23% early EXIT, 29% TIGHTEN, 48% HOLD till natural exit |
+| Training data | 108 premium trajectories from all backtest journeys (high/medium/low) |
+| Episodes | 259,000+ |
+| Policy | 19% early EXIT, 36% TIGHTEN, 44% HOLD till natural exit |
 
 The RL agent is decoupled from entry timing — all state features are trade-relative. It learns when to exit early vs hold based purely on the shape of the premium trajectory.
 
@@ -465,50 +511,57 @@ Kelly sizing:     20% more capital per trade vs MEDIUM
 
 ---
 
-## Backtest Results (March–April 2026, ~11 Trading Days)
+## Backtest Results (March–April 2026, 15 Trading Days)
 
 These results are from `tick_replay_backtest.py` using **actual historical tick data** — the same pipeline runs in live mode. All three risk profiles were tested on the same date range.
+
+### MEDIUM Risk — Recommended
+
+| Metric | Value |
+|---|---|
+| Total Trades | 42 |
+| Win Rate | **60%** |
+| Risk-Reward | **2.90** |
+| Net P&L | **+₹41,822** |
+| Avg per Trade | +₹996 |
+| Avg Win | +₹2,184 |
+| Avg Loss | -₹752 |
+| Max Drawdown | -₹4,726 |
+
+Strategy breakdown: bearish_momentum 72% WR (+₹30,122) · mean_reversion 100% WR (+₹11,667) · vwap_momentum_breakout 23% WR (+₹34)
+
+Exit breakdown: TRAILING_SL 50%, SL 24%, RL_EXIT 14%, TIMEOUT 10%, EOD 2%
 
 ### HIGH Risk
 
 | Metric | Value |
 |---|---|
-| Total Trades | 37 |
-| Win Rate | **62%** |
-| Net P&L | **+₹20,434** |
-| Avg per Trade | +₹552 |
-| Avg Win | +₹1,773 |
-| Avg Loss | -₹1,453 |
+| Total Trades | 49 |
+| Win Rate | **53%** |
+| Risk-Reward | **1.98** |
+| Net P&L | **+₹29,023** |
+| Avg per Trade | +₹592 |
+| Avg Win | +₹2,017 |
+| Avg Loss | -₹1,018 |
+| Max Drawdown | -₹5,162 |
 
-Exit breakdown: TRAILING_SL 46%, SL 27%, RL_EXIT 14%, TIMEOUT 11%, EOD 3%
-
-### MEDIUM Risk
-
-| Metric | Value |
-|---|---|
-| Total Trades | 32 |
-| Win Rate | **72%** |
-| Net P&L | **+₹29,689** |
-| Avg per Trade | +₹928 |
-| Avg Win | +₹1,884 |
-| Avg Loss | -₹1,516 |
-
-Exit breakdown: TRAILING_SL 47%, SL 22%, RL_EXIT 16%, TIMEOUT 12%, EOD 3%
+Exit breakdown: TRAILING_SL 49%, SL 27%, RL_EXIT 12%, TIMEOUT 10%, EOD 2%
 
 ### LOW Risk
 
 | Metric | Value |
 |---|---|
-| Total Trades | 9 |
-| Win Rate | **78%** |
-| Net P&L | **+₹9,408** |
-| Avg per Trade | +₹1,045 |
-| Avg Win | +₹1,400 |
-| Avg Loss | -₹197 |
+| Total Trades | 17 |
+| Win Rate | **53%** |
+| Risk-Reward | **2.83** |
+| Net P&L | **+₹11,597** |
+| Avg per Trade | +₹682 |
+| Avg Win | +₹1,878 |
+| Avg Loss | -₹663 |
 
-Exit breakdown: TRAILING_SL 89%, TIMEOUT 11%
+Exit breakdown: TRAILING_SL 88%, SL 6%, TIMEOUT 6%
 
-> **Note**: The RL_EXIT agent contributes ~14–16% of exits (profitable early exits). Trailing SL is the most common profitable exit type. The backtest was run with the max_trades/day gate disabled to collect maximum training data.
+> **Notes**: The RL_EXIT agent contributes ~12–14% of exits across profiles (all profitable). MEDIUM has the best risk-reward (2.90×) and the highest mean_reversion win rate (100%, 4 trades). The vwap_momentum_breakout strategy (CALL) is active but underperforms in this date range — March 2026 was predominantly a bearish/sideways market where PUT signals naturally dominate. CALL performance is expected to improve in bull-trend periods. The max_trades/day gate is currently disabled to accumulate training data.
 
 ---
 

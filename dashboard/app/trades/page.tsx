@@ -5,6 +5,7 @@ import Sidebar from "@/components/Sidebar";
 import TradeTable from "@/components/TradeTable";
 import PnlBarChart from "@/components/PnlBarChart";
 import { fetchJSON, type Trade, type LiveTrade, type JourneyPoint } from "@/lib/api";
+import { toDateStr, toISTTimeFull } from "@/lib/time";
 import { useTradingMode } from "@/contexts/TradingModeContext";
 import { Download, Activity } from "lucide-react";
 import { LineChart, Line, XAxis, YAxis, Tooltip, ReferenceLine, ResponsiveContainer, CartesianGrid } from "recharts";
@@ -209,8 +210,8 @@ function BacktestTradeRows({ trades, risk }: { trades: Trade[]; risk: RiskLevel 
         return (
           <React.Fragment key={i}>
             <tr>
-              <td style={{ color: "#5a6270" }}>{String(t.entry_time).slice(0, 10)}</td>
-              <td style={{ color: "#5a6270" }}>{String(t.entry_time).slice(11, 19)}</td>
+              <td style={{ color: "#5a6270" }}>{toDateStr(String(t.entry_time))}</td>
+              <td style={{ color: "#5a6270" }}>{toISTTimeFull(String(t.entry_time))}</td>
               <td style={{ color: "#c8cdd5" }}>{t.symbol}</td>
               <td>
                 <span style={{

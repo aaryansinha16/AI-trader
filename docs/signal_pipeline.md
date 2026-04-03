@@ -56,7 +56,7 @@ For 2 days (Mar 23-24), that's ~600 iterations — trivially fast.
 
 ---
 
-## 2. Live Mode (`frontend/app.py`)
+## 2. Live Mode (`backend/app.py`)
 
 ### Signal Scanning
 
