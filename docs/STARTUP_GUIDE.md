@@ -15,7 +15,7 @@ brew services start postgresql@17
 ```bash
 cd /Users/aaryansinha/Dev/Projects/ai-trader
 source .venv/bin/activate
-python frontend/app.py
+python backend/app.py
 ```
 
 Open **http://localhost:5050** in your browser.
@@ -61,7 +61,7 @@ Models are trained on 6 months of NIFTY data (Sep 2025 – Mar 2026).
 
 | Command | What it does |
 |---|---|
-| `python frontend/app.py` | Paper trading dashboard (web UI) |
+| `python backend/app.py` | Paper trading dashboard (web UI) |
 | `python main.py backtest-real` | Backtest on real historical data with ML |
 | `python main.py train` | Full model retraining from DB |
 | `python main.py ingest` | Fetch fresh data from TrueData |
