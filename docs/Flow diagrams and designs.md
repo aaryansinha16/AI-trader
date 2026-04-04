@@ -1,130 +1,132 @@
-# Flow diagrams and designs
+# Flow Diagrams and Designs
 
-Below is a **complete architecture package** for the AI intraday trading system we designed together.
+Below is an updated architecture package for the current AI Trader system.
 
-I’ll provide:
+This version is aligned to the code paths that are actively used today, especially:
 
-1️⃣ **High Level Design (HLD)**
+- `scripts/collect_ticks.py`
+- `backend/app.py`
+- `scripts/tick_replay_backtest.py`
+- `models/predict.py`
+- `models/strategy_models.py`
+- `models/rl_exit_agent.py`
+- `dashboard/app/*`
 
-2️⃣ **System Data Flow**
+Important alignment note:
 
-3️⃣ **Model Training Pipeline**
+- The current primary runtime is a **paper-trading / research system**
+- Live market data, backtesting, model training, and dashboarding are active
+- Zerodha execution modules exist in the repo, but they are **not the main active path**
+- The main backend flow currently ends in **trade suggestions + paper positions + monitoring**, not exchange execution
 
-4️⃣ **Live Trading Execution Pipeline**
-
-5️⃣ **Low Level Design (LLD)**
-
-6️⃣ **Database Schema**
-
-7️⃣ **Complete Mermaid Diagrams**
-
-Everything here can be pasted into **Mermaid renderers / Notion / GitHub / Obsidian / draw.io**.
-
-# 1. High Level Architecture (HLD)
+# 1. Current High-Level Architecture
 
 Core idea:
 
-Your system has **two worlds**:
+The system has two main worlds:
 
+```text
+Offline Research Layer (training + replay backtests)
+
+Live Paper-Trading Layer (real-time scanning + monitoring + dashboard)
 ```
-Offline Intelligence Layer (training/backtesting)
 
-Live Trading Layer (real-time decisions)
-```
-
-Data pipeline:
+Current top-level system flow:
 
 ```mermaid
 flowchart TD
 
-A[TrueData Tick Stream] --> B[Tick Data Collector]
+A["TrueData WebSocket + REST"] --> B["scripts/collect_ticks.py"]
 
-B --> C[Tick Database]
+B --> C1["tick_data (TimescaleDB)"]
+B --> C2["minute_candles (TimescaleDB)"]
+B --> C3["/tmp/td_live_prices.json"]
 
-C --> D[Aggregation Engine]
+C2 --> D["Feature Engineering<br/>compute_all_macro_indicators()"]
+D --> E["Regime Detection"]
+D --> F["Signal Generation"]
 
-D --> E1[1 Second Candles]
-D --> E2[1 Minute Candles]
-D --> E3[5 Minute Candles]
+F --> G["Macro Model Probability"]
+D --> H["Strategy Model Gate"]
+D --> I["Flow Score<br/>(PCR or OBV/MFI fallback)"]
 
-E2 --> F[Feature Engineering Engine]
+E --> J["Final Trade Scoring + Regime Filters"]
+G --> J
+H --> J
+I --> J
+F --> J
 
-F --> G1[Technical Indicators]
-F --> G2[Options Flow Signals]
-F --> G3[Volume Signals]
+J --> K["Trade Suggestions"]
+K --> L["Auto or Manual Paper Entry"]
+L --> M["Open Paper Positions"]
 
-G1 --> H[ML Prediction Engine]
-G2 --> H
-G3 --> H
+C3 --> N["Tick Monitor Loop"]
+M --> N
+N --> O["SL / Target / Trailing / RL Exit / Regime Tighten"]
+O --> P["Closed Trades + Journey Persistence"]
 
-H --> I[Trade Scoring Engine]
-
-I --> J[Risk Manager]
-
-J --> K[Order Execution Engine]
-
-K --> L[Broker API - Zerodha]
-
-L --> M[Exchange]
+K --> Q["Flask API + SSE"]
+M --> Q
+P --> Q
+Q --> R["Next.js Dashboard"]
 ```
 
 # 2. Data Pipeline Architecture
 
-This diagram focuses only on **data ingestion and processing**.
+This diagram focuses on what the data layer does today.
 
 ```mermaid
 flowchart LR
 
-A[TrueData WebSocket] --> B[Tick Collector Service]
+A["TrueData WebSocket"] --> B["Tick Collector"]
+A --> C["REST Backfill / Last Bar Fallback"]
 
-B --> C[Tick Storage]
+B --> D["tick_data"]
+B --> E["In-memory 1m Aggregation"]
+E --> F["minute_candles"]
 
-C --> D[Aggregation Service]
+B --> G["Live Price Cache JSON"]
+C --> F
 
-D --> E1[1s Bars]
-D --> E2[1m Bars]
-D --> E3[5m Bars]
-
-E2 --> F[Feature Generator]
-
-F --> G[Feature Store]
-
-G --> H1[Backtesting Engine]
-G --> H2[ML Training Engine]
-G --> H3[Live Trading Engine]
+F --> H["Feature Computation"]
+H --> I["Scanner / Backtest / Training"]
+G --> J["Position Monitoring + SSE Prices"]
 ```
 
 Purpose:
 
-| Component | Role |
+| Component | Current role |
 | --- | --- |
-| Tick Collector | capture streaming ticks |
-| Aggregation | generate multiple timeframes |
-| Feature Generator | compute indicators |
-| Feature Store | ML dataset |
+| Tick Collector | captures live futures + option ticks |
+| Minute Aggregation | builds and upserts 1-minute candles |
+| Live Price Cache | shares freshest prices with Flask |
+| REST Backfill | fills stale/missing market data |
+| Feature Computation | derives macro indicators for scan/backtest/train |
 
-# 3. Machine Learning Training Pipeline
+# 3. Current Model Training Pipeline
 
-This pipeline runs **offline**.
+This is the offline training path that matches the current scripts and saved models.
 
 ```mermaid
 flowchart TD
 
-A[Historical Market Data] --> B[Feature Engineering]
+A["minute_candles"] --> B["Macro Features"]
+B --> C["Macro Label Generation"]
+C --> D["Macro Model Training<br/>(XGBoost walk-forward)"]
+D --> E["models/saved/macro_model.pkl"]
 
-B --> C[Feature Dataset]
+F["tick_data"] --> G["Micro Features"]
+G --> H["Micro Label Generation"]
+H --> I["Micro Model Training<br/>(XGBoost walk-forward)"]
+I --> J["models/saved/micro_model.pkl"]
 
-C --> D[Label Generation]
+K["backtest_results/trades_*.csv"] --> L["Outcome Dataset Builder"]
+L --> M["Per-Strategy Outcome Model Training"]
+M --> N["models/saved/strategy/*.pkl"]
 
-D --> E[Training Dataset]
-
-E --> F[Model Training]
-
-F --> G[Model Validation]
-
-G --> H[Model Registry]
-
-H --> I[Production Model]
+O["backtest_results/journeys_*.json"] --> P["Journey Loader"]
+P --> Q["RL Exit Agent Retraining"]
+Q --> R["models/saved/rl_exit_agent.pkl"]
 ```
 
 Training loop:
@@ -132,213 +134,289 @@ Training loop:
 ```mermaid
 flowchart TD
 
-A[Historical Dataset] --> B[Train Model]
+A["Historical / Outcome Data"] --> B["Train Candidate Model"]
+B --> C["Walk-Forward Validation"]
+C --> D{"Good Enough?"}
 
-B --> C[Test Model]
-
-C --> D{Performance OK?}
-
-D -- Yes --> E[Deploy Model]
-
-D -- No --> B
+D -- "Yes" --> E["Save Model + Backup Existing"]
+D -- "No" --> F["Tune Labels / Filters / Parameters"]
+F --> B
 ```
 
-# 4. Live Trading Execution Pipeline
+# 4. Current Live Paper-Trading Execution Pipeline
 
-Real-time system.
+This is the primary active runtime path in `backend/app.py`.
 
 ```mermaid
 flowchart TD
 
-A[Market Tick Arrives] --> B[Update Indicators]
+A["Background Scan Trigger"] --> B["Load Latest NIFTY-I minute_candles"]
+B --> C["Compute Macro Indicators"]
+C --> D["Detect Market Regime"]
+C --> E["Generate Strategy Signals"]
 
-B --> C[Generate Strategy Signals]
+E --> F["Predict Macro Probability"]
+E --> G["Predict Strategy Success Probability"]
+C --> H["Compute Flow Score"]
+D --> I["Apply Regime Strategy Map + Bonuses"]
 
-C --> D[Options Flow Detector]
+F --> J["Final Score"]
+G --> J
+H --> J
+I --> J
+E --> J
 
-D --> E[ML Probability Prediction]
+J --> K{"Pass gates and thresholds?"}
+K -- "No" --> L["Drop Signal"]
+K -- "Yes" --> M["Resolve ATM Option Symbol"]
 
-E --> F[Trade Scoring]
+M --> N["Fetch Entry Premium<br/>(cache -> DB candle -> REST)"]
+N --> O["Create Trade Suggestion"]
+O --> P{"Auto trade enabled?"}
 
-F --> G{Score > Threshold?}
-
-G -- Yes --> H[Risk Manager]
-
-H --> I[Place Order]
-
-I --> J[Broker API]
-
-J --> K[Exchange]
-
-G -- No --> L[Ignore Signal]
+P -- "Yes" --> Q["Open Paper Position"]
+P -- "No" --> R["Wait for Manual Entry"]
+R --> Q
 ```
 
-# 5. Decision Engine Logic
+# 5. Position Monitoring and Exit Logic
 
-Signal scoring logic:
+This is the active trade-management path in the Flask backend.
 
 ```mermaid
 flowchart TD
 
-A[Technical Signal] --> D[Score Calculator]
+A["Open Paper Position"] --> B["Tick Monitor Loop (1s)"]
+B --> C["Read /tmp/td_live_prices.json"]
+C --> D{"Fresh option price available?"}
 
-B[Options Flow Signal] --> D
+D -- "Yes" --> E["Use bid / live price"]
+D -- "No" --> F["REST last-bar fallback"]
+F --> E
 
-C[ML Probability] --> D
+E --> G["Update unrealised P&L"]
+G --> H["Record journey point"]
+H --> I["Breakeven / Trailing / Regime Tightening"]
+I --> J["Optional RL Exit Decision"]
 
-D --> E[Final Trade Score]
-
-E --> F{Score > 0.6 ?}
-
-F -->|Yes| G[Execute Trade]
-
-F -->|No| H[Reject]
+J --> K{"Exit condition hit?"}
+K -- "No" --> B
+K -- "Yes" --> L["Close Position"]
+L --> M["Persist closed trade JSONL"]
+M --> N["Expose via API / SSE / Dashboard"]
 ```
 
-Score formula:
+Current exit sources:
 
+```text
+SL_HIT
+TARGET_HIT
+TRAILING_SL
+RL_EXIT
+TIMEOUT
+EOD_CLOSE
 ```
-TradeScore =
-0.5 * ML_Probability
-+ 0.3 * OptionsFlowScore
-+ 0.2 * TechnicalSignalStrength
-```
 
----
+# 6. Current Decision Engine Logic
 
-# 6. Backtesting Architecture
-
-Used to validate strategies.
+Scoring logic as implemented today:
 
 ```mermaid
 flowchart TD
 
-A[Historical Data] --> B[Replay Engine]
+A["Raw Strategy Signal"] --> E["Score Composer"]
+B["Directional Macro Probability"] --> E
+C["Flow Score"] --> E
+D["Regime Bonus / Filter"] --> E
 
-B --> C[Strategy Engine]
-
-C --> D[Signal Generator]
-
-D --> E[Trade Simulator]
-
-E --> F[Portfolio Manager]
-
-F --> G[Performance Metrics]
+E --> F["Final Score"]
+F --> G["Strategy-specific gates"]
+G --> H["Suggestion or Reject"]
 ```
 
-Metrics calculated:
+Primary score formula:
 
+```text
+final_score =
+0.5 * directional_prob
++ 0.3 * flow_score
++ 0.2 * technical_strength
++ regime_bonus
 ```
+
+Important current behavior:
+
+- `strategy_prob` is used mainly as a **gate**, not as a weighted score term
+- PUT directional confidence is computed as `1 - ml_prob`
+- regime-specific thresholds are looser/tighter depending on market regime
+- some strategies have extra regime restrictions before they are allowed through
+
+# 7. Current Backtesting Architecture
+
+This aligns with `scripts/tick_replay_backtest.py`.
+
+```mermaid
+flowchart TD
+
+A["Historical tick_data"] --> B["Replay by trading day"]
+B --> C["Build minute candles during replay"]
+C --> D["Compute indicators"]
+D --> E["Detect regime"]
+D --> F["Generate signals"]
+
+F --> G["Macro model"]
+F --> H["Strategy model gate"]
+D --> I["Flow score + optional enrichments"]
+E --> J["Final score + risk-profile rules"]
+
+J --> K{"Trade qualifies?"}
+K -- "No" --> L["Continue replay"]
+K -- "Yes" --> M["Resolve option contract + premium path"]
+
+M --> N["Simulate entry/exit with spread assumptions"]
+N --> O["Dynamic SL / Target / Trailing / RL Exit"]
+O --> P["Trade record + journey"]
+P --> Q["CSV / JSON / Report / Equity Curve"]
+```
+
+Metrics produced today:
+
+```text
+Trade list
+P&L
 Win rate
 Profit factor
-Sharpe ratio
-Max drawdown
-Expectancy
+Avg win / avg loss
+Equity curve
+Journey traces per trade
 ```
 
----
-
-# 7. Low Level Architecture (LLD)
-
-System components.
+# 8. Current Low-Level Architecture (LLD)
 
 ```mermaid
 flowchart TD
 
-subgraph Data Layer
-A1[Tick Collector]
-A2[Aggregation Engine]
-A3[Feature Engine]
+subgraph DataLayer["Data Layer"]
+  A1["TrueDataAdapter"]
+  A2["collect_ticks.py"]
+  A3["database/db.py"]
+  A4["tick_data / minute_candles / option_chain / symbol_master"]
+  A5["/tmp/td_live_prices.json"]
 end
 
-subgraph Intelligence Layer
-B1[Technical Indicator Module]
-B2[Options Flow Detector]
-B3[ML Prediction Engine]
+subgraph IntelligenceLayer["Intelligence Layer"]
+  B1["features/indicators.py"]
+  B2["strategy/regime_detector.py"]
+  B3["strategy/signal_generator.py"]
+  B4["models/predict.py"]
+  B5["models/strategy_models.py"]
+  B6["models/rl_exit_agent.py"]
 end
 
-subgraph Decision Layer
-C1[Trade Scoring Engine]
-C2[Risk Manager]
+subgraph RuntimeLayer["Runtime Layer"]
+  C1["backend/app.py scanner"]
+  C2["trade suggestions"]
+  C3["paper positions"]
+  C4["tick monitor"]
+  C5["closed trade persistence"]
 end
 
-subgraph Execution Layer
-D1[Order Manager]
-D2[Broker Adapter]
+subgraph PresentationLayer["Presentation Layer"]
+  D1["Flask REST + SSE"]
+  D2["Next.js dashboard"]
 end
 
-subgraph Storage
-E1[Tick Database]
-E2[Feature Store]
-E3[Trade Logs]
+subgraph OfflineResearch["Offline Research"]
+  E1["scripts/tick_replay_backtest.py"]
+  E2["scripts/incremental_train.py"]
+  E3["scripts/train_outcome_models.py"]
+  E4["scripts/train_rl_on_journeys.py"]
 end
 
-A1 --> E1
 A1 --> A2
 A2 --> A3
-A3 --> E2
+A3 --> A4
+A2 --> A5
 
-A3 --> B1
-A3 --> B2
-A3 --> B3
+A4 --> B1
+B1 --> B2
+B1 --> B3
+B1 --> B4
+B1 --> B5
+B6 --> C4
 
-B1 --> C1
 B2 --> C1
 B3 --> C1
-
+B4 --> C1
+B5 --> C1
+A5 --> C4
 C1 --> C2
+C2 --> C3
+C3 --> C4
+C4 --> C5
+
 C2 --> D1
+C3 --> D1
+C5 --> D1
 D1 --> D2
-D2 --> BrokerAPI
+
+A4 --> E1
+A4 --> E2
+E1 --> E3
+E1 --> E4
 ```
 
-# 8. Service-Level Architecture
+# 9. Service-Level Architecture
 
-If you modularize the system:
+If the current system is further modularized, this is the split that best matches the current codebase.
 
 ```mermaid
 flowchart LR
 
-A[Market Data Service]
-B[Feature Service]
-C[ML Service]
-D[Signal Service]
-E[Execution Service]
-F[Risk Service]
-G[Backtest Service]
+A["Market Data Service"]
+B["Storage Service"]
+C["Feature + Signal Service"]
+D["Scoring Service"]
+E["Paper Execution Service"]
+F["Monitoring Service"]
+G["Research / Backtest Service"]
+H["Dashboard API Service"]
 
 A --> B
 B --> C
 C --> D
-D --> F
-F --> E
+D --> E
+E --> F
 
 B --> G
 C --> G
+D --> G
+F --> H
+E --> H
+D --> H
 ```
 
-# 9. Database Schema Design
+# 10. Current Storage Design
 
-### Tick Data Table
+### Tick Data
 
-```
+```text
 tick_data
 
 timestamp
 symbol
 price
 volume
+oi
 bid_price
 ask_price
 bid_qty
 ask_qty
 ```
 
----
+### Minute Candles
 
-### Minute Candle Table
-
-```
+```text
 minute_candles
 
 timestamp
@@ -349,173 +427,113 @@ low
 close
 volume
 vwap
+oi
 ```
 
----
+### Options / Symbol Metadata
 
-### Feature Table
-
-```
-features
-
-timestamp
-symbol
-rsi
-ema20
-ema50
-vwap_dist
-volume_ratio
-oi_change
-pcr
-atr
+```text
+option_chain
+symbol_master
 ```
 
----
+### Trade Outputs
 
-### Trade Log Table
-
-```
-trade_log
-
-trade_id
-timestamp
-symbol
-entry_price
-exit_price
-stop_loss
-target
-result
-pnl
+```text
+trade_log                  # DB-level trade history / backtest usage
+paper_trades/*.jsonl       # persisted Flask paper trades
+backtest_results/*.csv
+backtest_results/*.json
+backtest_results/journeys_*.json
 ```
 
----
+### Model Artifacts
 
-# 10. Project Folder Structure
-
-```
-ai_trading_system
-
-data/
-    tick_collector.py
-    aggregation.py
-
-features/
-    indicators.py
-    feature_engine.py
-
-models/
-    train_model.py
-    predictor.py
-
-strategy/
-    signal_generator.py
-    options_flow_detector.py
-
-risk/
-    risk_manager.py
-
-execution/
-    broker_adapter.py
-    order_manager.py
-
-backtest/
-    backtest_engine.py
-
-database/
-    schema.sql
-
-main.py
+```text
+models/saved/macro_model.pkl
+models/saved/micro_model.pkl
+models/saved/strategy/*.pkl
+models/saved/rl_exit_agent.pkl
+models/saved/backups/YYYYMMDD/*
 ```
 
----
-
-# 11. System Runtime Loop
+# 11. Actual Project Runtime Loop
 
 ```mermaid
 flowchart TD
 
-A[Tick Stream] --> B[Update Market Data]
+A["Every scan interval"] --> B["Load latest minute candles"]
+B --> C["Compute indicators"]
+C --> D["Detect regime"]
+C --> E["Generate candidate signals"]
+E --> F["Score and filter"]
 
-B --> C[Update Indicators]
+F --> G{"Qualified?"}
+G -- "No" --> H["Wait next scan"]
+G -- "Yes" --> I["Create suggestion"]
+I --> J{"Auto-enter?"}
+J -- "Yes" --> K["Open paper trade"]
+J -- "No" --> L["Dashboard manual enter"]
 
-C --> D[Generate Signals]
-
-D --> E[ML Prediction]
-
-E --> F[Trade Ranking]
-
-F --> G{Trade Valid?}
-
-G -->|Yes| H[Execute Order]
-
-G -->|No| I[Wait Next Tick]
+K --> M["Tick monitor every 1s"]
+L --> M
+M --> N["Manage exits + record journey"]
+N --> O["Push state via SSE"]
+H --> O
 ```
 
-Loop interval:
+Current cadence:
 
+```text
+Scanner: ~30 to 60 seconds depending on path
+Tick monitor: 1 second
+Live cache flush: 1 second
+Journey capture: ~5 seconds
 ```
-30–60 seconds
-```
 
----
-
-# 12. Final System Overview
+# 12. Dashboard and API Flow
 
 ```mermaid
 flowchart TD
 
-subgraph Market
-A[TrueData Tick Feed]
-end
+A["Flask state"] --> B["/api/state"]
+A --> C["/api/stream (SSE)"]
+A --> D["/api/paper/*"]
+A --> E["/api/backtest/*"]
+A --> F["/api/market/*"]
 
-subgraph DataPipeline
-B[Tick Collector]
-C[Tick DB]
-D[Aggregation Engine]
-end
-
-subgraph Intelligence
-E[Feature Engine]
-F[Options Flow Detector]
-G[ML Prediction]
-end
-
-subgraph Decision
-H[Trade Scoring]
-I[Risk Manager]
-end
-
-subgraph Execution
-J[Order Manager]
-K[Zerodha API]
-end
-
-A --> B
-B --> C
-C --> D
-D --> E
-E --> F
-E --> G
-F --> H
-G --> H
-H --> I
-I --> J
-J --> K
+C --> G["dashboard/app/live/page.tsx"]
+D --> H["dashboard/app/trades/page.tsx"]
+E --> I["dashboard/app/backtest/page.tsx"]
+F --> J["dashboard/app/charts/page.tsx"]
 ```
 
----
+# 13. Optional / Secondary Paths in the Repo
 
-# 13. Final Concept
+These exist in the repo but are not the primary current system path:
 
-Your system ultimately becomes a **mini quant trading engine** with:
-
-```
-Market Data
-+ Technical Signals
-+ Options Flow Analysis
-+ Machine Learning
-+ Risk Control
-+ Automated Execution
+```text
+execution/order_manager.py
+execution/broker_adapter.py
+models/dqn_exit_agent.py
+models/model_registry.py
+main.py live execution path
 ```
 
-All running locally on your laptop.
+They should be treated as optional or future-facing unless the runtime is explicitly switched to them.
+
+# 14. Final Current System Summary
+
+The current AI Trader system is best described as:
+
+```text
+Live TrueData ingestion
++ minute-candle feature pipeline
++ rule-based strategy generation
++ ML scoring and strategy gating
++ RL-assisted paper-trade exits
++ tick-replay backtesting
++ dashboard-driven monitoring
+```
+
+That is the architecture the Mermaid diagrams in this document now reflect.
