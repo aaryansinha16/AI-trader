@@ -6,7 +6,8 @@ Used by the backtest engine to trade actual option premiums instead of delta app
 """
 
 import re
-from datetime import date, datetime
+import time
+from datetime import date, datetime, timedelta
 from typing import Optional, Tuple
 
 import pandas as pd
@@ -17,15 +18,20 @@ from strategy.vol_surface import VolSurfaceModel
 
 logger = get_logger("option_resolver")
 
-# All historical expiry dates from our option data
+# All historical expiry dates from our option data (DB-derived)
 _EXPIRY_DATES = None
 _OPTION_PREMIUM_CACHE = {}
 
+# Live TrueData expiry list (cached for 1 hour to avoid hammering REST)
+_LIVE_EXPIRIES: list[date] | None = None
+_LIVE_EXPIRIES_FETCHED_AT: float = 0.0
+_LIVE_EXPIRIES_TTL = 3600.0  # 1 hour
 
-def _load_expiry_dates():
-    """Load all expiry dates from option symbols in DB (cached)."""
+
+def _load_expiry_dates(force_reload: bool = False):
+    """Load all historical expiry dates from option symbols in DB (cached)."""
     global _EXPIRY_DATES
-    if _EXPIRY_DATES is not None:
+    if _EXPIRY_DATES is not None and not force_reload:
         return _EXPIRY_DATES
 
     syms = read_sql("""
@@ -42,17 +48,111 @@ def _load_expiry_dates():
         except ValueError:
             pass
     _EXPIRY_DATES = sorted(dates)
-    logger.info(f"Loaded {len(_EXPIRY_DATES)} expiry dates from DB")
+    logger.info(f"Loaded {len(_EXPIRY_DATES)} historical expiry dates from DB")
     return _EXPIRY_DATES
 
 
+def _fetch_live_expiries_from_truedata() -> list[date]:
+    """
+    Pull the authoritative upcoming-expiry list from TrueData REST.
+
+    This is the only way to get the right answer because NSE periodically
+    moves NIFTY weekly expiry day (Thu → Wed → Tue → Mon historically), and
+    individual weeks may be holiday-adjusted. Hard-coding a weekday will
+    eventually break.
+
+    Cached for 1 hour. Returns empty list on failure (caller falls back to
+    DB-derived expiries).
+    """
+    global _LIVE_EXPIRIES, _LIVE_EXPIRIES_FETCHED_AT
+    now = time.time()
+    if _LIVE_EXPIRIES is not None and (now - _LIVE_EXPIRIES_FETCHED_AT) < _LIVE_EXPIRIES_TTL:
+        return _LIVE_EXPIRIES
+    try:
+        import requests
+        from data.truedata_adapter import TrueDataAdapter
+        td = TrueDataAdapter()
+        if not td.authenticate():
+            return _LIVE_EXPIRIES or []
+        r = requests.get(
+            "https://history.truedata.in/getSymbolExpiryList",
+            params={"symbol": "NIFTY", "response": "csv"},
+            headers=td._auth_header(),
+            timeout=15,
+        )
+        r.raise_for_status()
+        out: list[date] = []
+        for ln in r.text.strip().split("\n")[1:]:  # skip "expiry" header
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                d = datetime.strptime(ln, "%Y-%m-%d").date()
+                if d.year >= 2099:  # placeholder
+                    continue
+                out.append(d)
+            except ValueError:
+                continue
+        out.sort()
+        _LIVE_EXPIRIES = out
+        _LIVE_EXPIRIES_FETCHED_AT = now
+        logger.info(f"Fetched {len(out)} live NIFTY expiries from TrueData REST: next 5 = {out[:5]}")
+        return out
+    except Exception as e:
+        logger.warning(f"Live expiry fetch failed: {e}")
+        return _LIVE_EXPIRIES or []
+
+
 def get_nearest_expiry(ref_date: date) -> Optional[date]:
-    """Find the nearest expiry on or after ref_date."""
-    expiries = _load_expiry_dates()
-    for e in expiries:
+    """
+    Find the nearest NIFTY expiry on or after ref_date.
+
+    Two distinct paths:
+      • **Historical / backtest dates** (ref_date < today): look up the
+        DB-derived list. This is what was actually traded on that date,
+        which is what a faithful backtest needs. Live REST has no
+        knowledge of contracts that already expired.
+      • **Today or future dates**: use TrueData REST `getSymbolExpiryList`
+        as the source of truth. NSE periodically moves NIFTY weekly expiry
+        day (Thu → Wed → Tue → Mon historically), and individual weeks may
+        be holiday-shifted, so any hard-coded weekday eventually breaks.
+
+    NEVER returns a date in the past relative to ref_date. The previous
+    `expiries[-1]` fallback was the bug on 2026-04-08: it returned the
+    last DB entry (Apr 7) when called on Apr 8, causing the live collector
+    to subscribe to contracts that had expired the previous day.
+
+    NIFTY-only. BANKNIFTY/FINNIFTY use monthly expiries — see
+    scripts/_market_data_lib.get_current_monthly_expiry() for those.
+    """
+    today = date.today()
+
+    # ── Historical lookup (backtests) ─────────────────────────────────
+    if ref_date < today:
+        for e in _load_expiry_dates():
+            if e >= ref_date:
+                return e
+        # Last-ditch reload
+        for e in _load_expiry_dates(force_reload=True):
+            if e >= ref_date:
+                return e
+        logger.error(f"No historical expiry found for ref_date={ref_date}")
+        return None
+
+    # ── Live lookup (today / future) ──────────────────────────────────
+    live = _fetch_live_expiries_from_truedata()
+    for e in live:
         if e >= ref_date:
             return e
-    return expiries[-1] if expiries else None
+
+    # TrueData unreachable — fall back to DB (best effort), but still
+    # filter out expired dates so we never subscribe to a dead contract.
+    for e in _load_expiry_dates():
+        if e >= ref_date:
+            return e
+
+    logger.error(f"No live or DB expiry found for ref_date={ref_date}")
+    return None
 
 
 def get_days_to_expiry(ref_date: date, expiry: date) -> int:
@@ -81,11 +181,52 @@ def get_atm_strike(index_price: float, strike_gap: int = 50) -> int:
 
 
 def load_option_premiums_for_day(symbol: str, trading_date: date) -> pd.DataFrame:
-    """Load all 1-min premium bars for an option symbol on a given day."""
+    """
+    Load option premium data for a single day.
+
+    Tries TICK data first (full intra-minute resolution), falls back to
+    1-min candles if ticks aren't available.
+
+    The returned DataFrame has a `_mode` attribute set to "tick" or "candle"
+    so check_exit() can branch on resolution. Caller MUST honour this:
+
+      - "tick" mode: rows are individual ticks. Each row has columns
+            [timestamp, premium, bid, ask] (no high/low/volume aggregation).
+            check_exit() walks every tick in chronological order.
+      - "candle" mode: rows are 1-min OHLCV bars. Each row has columns
+            [timestamp, open, high, low, premium (=close), volume, oi].
+            check_exit() uses bar high/low approximations.
+
+    Tick mode is dramatically more accurate for trailing-stop and SL logic
+    because it doesn't have to guess the intra-minute price sequence.
+    """
     cache_key = (symbol, str(trading_date))
     if cache_key in _OPTION_PREMIUM_CACHE:
         return _OPTION_PREMIUM_CACHE[cache_key]
 
+    # ── Try ticks first ──────────────────────────────────────────────
+    # Threshold: we want at least ~50 ticks to make tick-mode worthwhile.
+    # Below that, the candles probably have richer info (TrueData backfills
+    # candles even on illiquid strikes via vol-surface estimation).
+    tick_df = read_sql(
+        "SELECT timestamp, price as premium, bid_price as bid, ask_price as ask "
+        "FROM tick_data "
+        "WHERE symbol = :sym AND timestamp::date = :dt "
+        "ORDER BY timestamp",
+        {"sym": symbol, "dt": str(trading_date)},
+    )
+
+    if not tick_df.empty and len(tick_df) >= 50:
+        tick_df["timestamp"] = pd.to_datetime(tick_df["timestamp"])
+        # Bid/ask may be 0 on some feeds — fall back to mid (premium) so
+        # downstream slippage logic works.
+        tick_df["bid"] = tick_df["bid"].where(tick_df["bid"] > 0, tick_df["premium"])
+        tick_df["ask"] = tick_df["ask"].where(tick_df["ask"] > 0, tick_df["premium"])
+        tick_df.attrs["_mode"] = "tick"
+        _OPTION_PREMIUM_CACHE[cache_key] = tick_df
+        return tick_df
+
+    # ── Fall back to candles ─────────────────────────────────────────
     df = read_sql(
         "SELECT timestamp, open, high, low, close as premium, volume, oi "
         "FROM minute_candles "
@@ -95,6 +236,7 @@ def load_option_premiums_for_day(symbol: str, trading_date: date) -> pd.DataFram
     )
     if not df.empty:
         df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df.attrs["_mode"] = "candle"
     _OPTION_PREMIUM_CACHE[cache_key] = df
     return df
 

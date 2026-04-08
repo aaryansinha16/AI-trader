@@ -260,9 +260,12 @@ class StrategyPredictor:
                 try:
                     data = joblib.load(path)
                     self._models[name] = data
+                    metrics = data.get("metrics") or {}
+                    auc = metrics.get("auc_roc", data.get("cv_auc", "?"))
+                    n = data.get("n_samples", "?")
                     logger.info(
                         f"Loaded {name} model ({len(data['features'])} features, "
-                        f"AUC={data['metrics'].get('auc_roc', '?')})"
+                        f"n={n}, AUC={auc})"
                     )
                 except Exception as e:
                     logger.error(f"Failed to load {name} model: {e}")

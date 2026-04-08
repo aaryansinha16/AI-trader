@@ -150,9 +150,13 @@ MEDIUM_RISK = RiskProfile(
     sl_max_pct=0.22,
     tgt_min_pct=0.40,
     tgt_max_pct=0.80,
-    # Trailing — activate at 12%, lock at 8% (earlier than before)
-    trailing_trigger=0.12,
-    trailing_lock=0.08,
+    # Trailing — activate at 8%, lock at 5% (lowered 2026-04-08 from 12/8 after
+    # spike-and-revert analysis: 15 losing trades reached >=8% TRUE bar-high
+    # peak before reverting, totaling ₹-6,988. Lower trigger ensures the
+    # trailing SL ratchets up sooner so even single-bar spikes get partial
+    # protection.)
+    trailing_trigger=0.08,
+    trailing_lock=0.05,
     # Entry selectivity — bearish_momentum drives profits; VMB disabled in backtest
     score_threshold=0.60,
     put_score_threshold=0.70,   # raised from 0.68: afternoon SL analysis showed weak PUTs cluster at 0.68-0.69
@@ -204,9 +208,9 @@ HIGH_RISK = RiskProfile(
     sl_max_pct=0.22,
     tgt_min_pct=0.40,
     tgt_max_pct=0.80,
-    # Trailing — same as MEDIUM
-    trailing_trigger=0.12,
-    trailing_lock=0.08,
+    # Trailing — same as MEDIUM (lowered to 8/5 on 2026-04-08)
+    trailing_trigger=0.08,
+    trailing_lock=0.05,
     # Entry selectivity — same as MEDIUM; HIGH edge = 20% more size, not different signals
     score_threshold=0.60,
     put_score_threshold=0.70,   # raised from 0.68: matches MEDIUM's tightened threshold

@@ -228,15 +228,13 @@ def on_tick(tick: dict):
     ts = tick.get("timestamp", datetime.now())
     minute_ts = ts.replace(second=0, microsecond=0)
 
-    # Map spot symbol back to futures symbol for consistency
-    original_symbol = symbol
-    symbol_map = {v: k for k, v in TD_INDEX_SPOT_SYMBOLS.items()}
-    if symbol in symbol_map:
-        # Store as NIFTY-I internally
-        tick["symbol"] = TD_INDEX_FUTURES_SYMBOLS.get(symbol_map[symbol], symbol)
-        symbol = tick["symbol"]
+    # Defensive: if a stale subscription somehow delivers a spot symbol
+    # (e.g. NIFTY 50, NIFTY BANK), drop the tick. We never want spot data
+    # mixed into a futures symbol's tick stream — see fix in main() above.
+    if symbol in TD_INDEX_SPOT_SYMBOLS.values():
+        return
 
-    # Update live price cache immediately (cache both original and remapped names)
+    # Update live price cache immediately.
     # Use wall-clock time as "ts" so Flask's freshness check sees when WE received the tick,
     # not the market timestamp (which can be hours old for illiquid options snapshots).
     price = tick.get("price", 0)
@@ -250,8 +248,6 @@ def on_tick(tick: dict):
             "ts": datetime.now().isoformat(),
         }
         live_price_cache[symbol] = entry
-        if original_symbol != symbol:
-            live_price_cache[original_symbol] = entry
 
     # Initialize buffer for new symbols
     if symbol not in candle_buffer:
@@ -359,7 +355,16 @@ def main():
     # ── Build subscription list ──────────────────────────────────────────
     subscribe_symbols = []
 
-    # Index futures (for tick data)
+    # Index futures ONLY — do NOT subscribe to spot (`NIFTY 50`).
+    # Background: prior versions subscribed to spot AND futures, then remapped
+    # spot ticks to symbol='NIFTY-I' in on_tick() so the dashboard could show
+    # "spot price". The side effect was catastrophic: spot and futures ticks
+    # got merged under one symbol with a ~50pt price gap, corrupting both
+    # tick_data and the minute_candles aggregated from them. Every macro
+    # indicator (RSI, ATR, Bollinger, MACD) saw artificial 50pt swings each
+    # minute → strategies saw whipsaw → no signals fired.
+    # Fix (2026-04-08): subscribe to futures only. Trading is on futures-derived
+    # options anyway; we don't need spot for any decision.
     for sym_key in SYMBOLS:
         futures_sym = TD_INDEX_FUTURES_SYMBOLS.get(sym_key)
         if futures_sym:

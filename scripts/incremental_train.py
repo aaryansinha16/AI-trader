@@ -106,13 +106,18 @@ def main():
                     print(f"    {row['feature']:30s}  {row['importance']:.4f}")
 
             # ── Strategy models ──────────────────────────────────────────
-            print("\n  --- STRATEGY MODELS ---")
-            try:
-                strat_results = train_all_strategy_models(featured.copy())
-                for name, info in strat_results.items():
-                    print(f"  {name}: {info.get('metrics', 'trained') if info else 'skipped (insufficient data)'}")
-            except Exception as e:
-                print(f"  Strategy model training error: {e}")
+            # DISABLED 2026-04-08: train_all_strategy_models() uses synthetic
+            # forward-return labels which produce broken models (bearish_momentum
+            # came out with AUC=nan and outputs <0.02 → 58% of PUT signals
+            # silently dropped at the strat_prob>0.02 gate). Strategy models
+            # are now trained exclusively by scripts/train_outcome_models.py
+            # using ACTUAL backtest WIN/LOSS outcomes, which gives real
+            # discrimination power even on small sample sizes.
+            #
+            # If you re-enable this block, you will overwrite the
+            # outcome-trained models with synthetic-label garbage every night.
+            print("\n  --- STRATEGY MODELS (skipped — see comment) ---")
+            print("  Use: python scripts/train_outcome_models.py")
 
     # ── MICRO MODEL — full retrain on ALL available tick data ────────────
     if not args.macro_only:
