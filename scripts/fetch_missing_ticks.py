@@ -10,7 +10,7 @@ import argparse
 from datetime import datetime, date, timedelta
 import pandas as pd
 from data.truedata_adapter import TrueDataAdapter
-from database.db import get_engine, write_df
+from database.db import get_engine, write_df, upsert_candles
 from utils.logger import get_logger
 
 logger = get_logger("fetch_missing_ticks")
@@ -135,14 +135,13 @@ def store_candles(candles_df: pd.DataFrame) -> int:
     # Select only required columns
     candles_df = candles_df[required_cols].copy()
     
-    # Use pandas to_sql with append mode
     initial_count = len(candles_df)
     try:
-        write_df(candles_df, 'minute_candles', if_exists='append')
-        logger.info(f"Inserted {initial_count} candles into minute_candles")
+        upsert_candles(candles_df)
+        logger.info(f"Upserted {initial_count} candles into minute_candles")
         return initial_count
     except Exception as e:
-        logger.error(f"Error inserting candles: {e}")
+        logger.error(f"Error upserting candles: {e}")
         return 0
 
 
