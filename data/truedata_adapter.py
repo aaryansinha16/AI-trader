@@ -534,8 +534,12 @@ class TrueDataAdapter:
             logger.error("WebSocket not connected. Call ws_connect() first.")
             return
 
-        # Track for reconnect
-        self._subscribed_symbols = list(symbols)
+        # Track for reconnect — accumulate, don't replace, so NIFTY-I isn't lost
+        # when dynamic ATM re-subscription calls ws_subscribe with only new options
+        existing = set(self._subscribed_symbols)
+        for s in symbols:
+            if s not in existing:
+                self._subscribed_symbols.append(s)
         msg = json.dumps({"method": "addsymbol", "symbols": symbols})
         self._ws.send(msg)
         logger.info(f"WebSocket subscribing to {len(symbols)} symbols: {symbols[:5]}{'...' if len(symbols) > 5 else ''}")

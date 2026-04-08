@@ -5,6 +5,7 @@ export const SSE_STREAM_URL = `${API_BASE}/api/stream`;
 export interface StreamPayload {
   state: {
     last_price: number;
+    spot_price?: number;
     regime: string;
     status: string;
     last_scan: string | null;
@@ -48,6 +49,7 @@ export interface LiveState {
   status: string;
   last_scan: string | null;
   last_price: number;
+  spot_price?: number;
   regime: string;
   models_loaded: boolean;
   strategy_models_loaded: string[];

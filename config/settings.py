@@ -52,20 +52,35 @@ SYMBOLS = ["NIFTY"]
 TD_INDEX_SPOT_SYMBOLS = {
     "NIFTY": "NIFTY 50",
     "BANKNIFTY": "NIFTY BANK",
+    "FINNIFTY": "NIFTY FIN SERVICE",
 }
 # Continuous futures (for historical data / charting)
 TD_INDEX_FUTURES_SYMBOLS = {
     "NIFTY": "NIFTY-I",
     "BANKNIFTY": "BANKNIFTY-I",
+    "FINNIFTY": "FINNIFTY-I",
 }
 # Backwards-compat alias used by main.py ingest
 TD_INDEX_SYMBOLS = TD_INDEX_FUTURES_SYMBOLS
 
-# Strike gap per underlying (NIFTY = 50pt, BANKNIFTY = 100pt)
+# Strike gap per underlying (verified via TrueData REST 2026-04-07)
 STRIKE_GAP = {
     "NIFTY": 50,
     "BANKNIFTY": 100,
+    "FINNIFTY": 50,
 }
+
+# Expiry cadence (NIFTY = weekly Tue, others = monthly last Tue)
+# BANKNIFTY weekly options were discontinued by NSE in late 2024.
+EXPIRY_CADENCE = {
+    "NIFTY": "weekly",
+    "BANKNIFTY": "monthly",
+    "FINNIFTY": "monthly",
+}
+
+# Symbols collected EOD-only via REST (no live websocket subscription).
+# Used by scripts/seed_other_symbols.py and scripts/eod_collect_other_symbols.py.
+EOD_ONLY_SYMBOLS = ["BANKNIFTY", "FINNIFTY"]
 
 # Number of strikes above/below ATM to track (±3 = 7 strikes per CE/PE)
 ATM_RANGE = int(os.getenv("ATM_RANGE", "3"))

@@ -204,10 +204,20 @@ export default function LivePage() {
               </div>
             </div>
             <div>
-              <p className="text-[9px] uppercase tracking-[1.5px] mb-1" style={{ color: '#5a6270' }}>NIFTY Price</p>
-              <p className="text-xl font-bold" style={{ color: '#4da6ff' }}>
-                {state?.last_price ? `₹${state.last_price.toLocaleString("en-IN", { maximumFractionDigits: 1 })}` : "--"}
+              <p className="text-[9px] uppercase tracking-[1.5px] mb-1" style={{ color: '#5a6270' }}>
+                NIFTY <span style={{ color: '#3d4450' }}>· FUTURES</span>
               </p>
+              {(() => {
+                // System trades on futures only — no spot subscription
+                const futPrice = state?.last_price ?? null;
+                return (
+                  <p className="text-xl font-bold" style={{ color: '#4da6ff' }}>
+                    {futPrice
+                      ? `₹${futPrice.toLocaleString("en-IN", { maximumFractionDigits: 1 })}`
+                      : "--"}
+                  </p>
+                );
+              })()}
             </div>
             <div>
               <p className="text-[9px] uppercase tracking-[1.5px] mb-1" style={{ color: '#5a6270' }}>Market Regime</p>

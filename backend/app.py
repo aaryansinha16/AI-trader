@@ -51,6 +51,7 @@ CORS(app)  # Allow Next.js dev server on :3000
 # ── Global State ──────────────────────────────────────────────────────────────
 scanner_enabled = True      # Start/stop toggle for the background scanner
 auto_trade_enabled = True   # Auto-enter paper trades when signals fire (vs manual)
+_sse_client_count = 0       # Number of active SSE connections (frontend clients)
 
 state = {
     "status": "initializing",
@@ -127,7 +128,7 @@ def _get_mode_positions(mode: str = None) -> list:
 
 BREAKEVEN_AFTER_MIN   = 15    # minutes in any profit → move SL to entry
 BREAKEVEN_MIN_PROFIT  = 0.02  # must be at least +2% in profit to trigger BE
-REGIME_CHECK_INTERVAL = 30    # seconds between regime checks per position
+REGIME_CHECK_INTERVAL = 10    # seconds between regime checks per position (was 30)
 
 
 def _auto_enter_position(trade: dict, trade_mode: str = "test"):
@@ -406,6 +407,99 @@ def initialize():
     _load_paper_trade_history()
     logger.info("Dashboard initialized.")
 
+    # ── Startup backfill: fill today's missing candles from 9:15 to now ──────
+    # Runs in a background thread so the server starts immediately.
+    def _startup_backfill():
+        try:
+            if not _is_market_hours():
+                return
+            today = date.today()
+            day_start = datetime(today.year, today.month, today.day, 9, 15, 0)
+            end_dt = datetime.now()
+
+            # Find the first candle we have today (could be None if totally missing)
+            first = read_sql(
+                "SELECT MIN(timestamp) as first_bar FROM minute_candles "
+                "WHERE symbol = 'NIFTY-I' AND timestamp::date = :d",
+                {"d": today.isoformat()}
+            )
+            first_bar = None
+            if not first.empty and first.iloc[0]["first_bar"] is not None:
+                first_bar = pd.to_datetime(first.iloc[0]["first_bar"], utc=True)
+                first_bar_ist = first_bar.tz_convert("Asia/Kolkata").replace(tzinfo=None)
+                # If we already have data from 9:15, skip
+                if first_bar_ist.hour == 9 and first_bar_ist.minute <= 16:
+                    logger.info("Startup backfill: candles already start from 9:15, skipping.")
+                    return
+
+            from data.truedata_adapter import TrueDataAdapter
+            from database.db import upsert_candles as _upsert
+            from backtest.option_resolver import get_nearest_expiry
+
+            td_bf = TrueDataAdapter()
+            if not td_bf.authenticate():
+                logger.warning("Startup backfill: TrueData auth failed, skipping.")
+                return
+
+            logger.info(f"Startup backfill: fetching NIFTY-I candles from 09:15 to {end_dt.strftime('%H:%M')}...")
+            bars = td_bf.fetch_historical_bars("NIFTY-I", day_start, end_dt, interval="1min")
+            if not bars.empty:
+                for col in ["vwap", "oi"]:
+                    if col not in bars.columns:
+                        bars[col] = 0
+                bars = bars[["timestamp", "symbol", "open", "high", "low", "close", "volume", "vwap", "oi"]]
+                _upsert(bars)
+                logger.info(f"Startup backfill: upserted {len(bars)} NIFTY-I candles.")
+
+            # Also backfill ATM option candles for current strike range
+            import time as _time
+            nifty_close = 0
+            if not bars.empty:
+                nifty_close = float(bars.iloc[-1]["close"])
+            if nifty_close > 0:
+                atm = round(nifty_close / 50) * 50
+                expiry = get_nearest_expiry(today)
+                if expiry:
+                    exp_code = expiry.strftime("%y%m%d")
+                    for delta in range(-3, 4):
+                        strike = atm + delta * 50
+                        for opt in ["CE", "PE"]:
+                            sym = f"NIFTY{exp_code}{strike}{opt}"
+                            chk = read_sql(
+                                "SELECT COUNT(*) as cnt FROM minute_candles WHERE symbol=:s AND timestamp::date=:d",
+                                {"s": sym, "d": today.isoformat()}
+                            )
+                            cnt = int(chk.iloc[0]["cnt"]) if not chk.empty else 0
+                            # Only fetch if less than 50% expected bars
+                            expected = max(1, int((end_dt - day_start).total_seconds() / 60))
+                            if cnt < expected * 0.5:
+                                try:
+                                    ob = td_bf.fetch_historical_bars(sym, day_start, end_dt, interval="1min")
+                                    if not ob.empty:
+                                        for col in ["vwap", "oi"]:
+                                            if col not in ob.columns:
+                                                ob[col] = 0
+                                        ob = ob[["timestamp", "symbol", "open", "high", "low", "close", "volume", "vwap", "oi"]]
+                                        _upsert(ob)
+                                        logger.info(f"Startup backfill {sym}: {len(ob)} bars")
+                                    _time.sleep(1.1)
+                                except Exception as e:
+                                    logger.warning(f"Startup backfill {sym}: {e}")
+            # ── Tick backfill (NIFTY-I only — 5-day REST window) ──────────────
+            # Mirrors the candle backfill: fills tick gaps from 09:15 onwards
+            # so the live chart and micro features have continuous data.
+            try:
+                _backfill_ticks_if_stale()
+            except Exception as e:
+                logger.warning(f"Startup tick backfill error: {e}")
+
+            logger.info("Startup backfill complete.")
+        except Exception as e:
+            logger.warning(f"Startup backfill error: {e}")
+
+    import threading as _th
+    _th.Thread(target=_startup_backfill, daemon=True, name="startup-backfill").start()
+
 
 def _is_market_hours() -> bool:
     """Return True if current IST time is within market hours 9:15–15:30."""
@@ -413,6 +507,155 @@ def _is_market_hours() -> bool:
     t = now_ist.time()
     from datetime import time as dtime
     return dtime(9, 15) <= t <= dtime(15, 31)
+
+
+# How long the tick stream can be silent before we trigger a REST backfill
+# (the WebSocket sends ~150-180 ticks/min during a normal session, so >120s
+# gap means a real disconnect, not just illiquid quiet)
+TICK_STALENESS_THRESHOLD_SECS = 120
+
+# Throttle: never run the tick backfill more than once every N seconds
+_last_tick_backfill_run = 0.0
+_TICK_BACKFILL_MIN_INTERVAL = 60.0
+
+
+def _detect_tick_gaps_today(min_gap_secs: int = TICK_STALENESS_THRESHOLD_SECS) -> list:
+    """
+    Find time windows in today's NIFTY-I tick stream where no ticks exist
+    for >= min_gap_secs. Returns a list of (start_dt, end_dt) tuples in IST
+    naive datetimes. Includes the trailing gap (last tick → now) if stale.
+
+    Used by _backfill_ticks_if_stale() so it fixes BOTH leading/internal
+    gaps (09:15 → first observed tick) AND any subsequent dropouts.
+    """
+    today = date.today()
+    session_start = datetime(today.year, today.month, today.day, 9, 15, 0)
+    now_ist = datetime.now()
+    if now_ist < session_start:
+        return []
+
+    df = read_sql(
+        "SELECT timestamp FROM tick_data WHERE symbol = 'NIFTY-I' "
+        "AND timestamp::date = :d ORDER BY timestamp",
+        {"d": today.isoformat()},
+    )
+
+    if df.empty:
+        return [(session_start, now_ist)]
+
+    # Normalize to naive IST (DB column is TIMESTAMPTZ; convert)
+    ts_series = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
+    ticks = ts_series.tolist()
+
+    gaps: list[tuple[datetime, datetime]] = []
+
+    # Leading gap: 09:15 → first tick
+    if (ticks[0] - session_start).total_seconds() >= min_gap_secs:
+        gaps.append((session_start, ticks[0]))
+
+    # Internal gaps: any consecutive pair >= min_gap_secs apart
+    for i in range(1, len(ticks)):
+        delta = (ticks[i] - ticks[i - 1]).total_seconds()
+        if delta >= min_gap_secs:
+            gaps.append((ticks[i - 1], ticks[i]))
+
+    # Trailing gap: last tick → now
+    if (now_ist - ticks[-1]).total_seconds() >= min_gap_secs:
+        gaps.append((ticks[-1], now_ist))
+
+    return gaps
+
+
+def _backfill_ticks_if_stale():
+    """
+    During market hours, scan today's NIFTY-I tick coverage for gaps and
+    fill each one via TrueData REST `getticks`. Idempotent: deletes the
+    affected window first to dedupe with anything the websocket has
+    streamed in parallel.
+
+    Why mirror this from the candle backfill rather than relying on the
+    websocket alone:
+      • TrueData WebSocket drops several times per session (Connection
+        timed out → 5-15 minute reconnect gap), and on 2026-04-08 produced
+        long sparse intervals in the live tick chart.
+      • REST `getticks` covers the last 5 days at full bid/ask/OI fidelity,
+        so any gap inside the 5-day window can be silently patched.
+      • EOD scripts also patch gaps, but waiting until 16:00 means the
+        scoring loop and the live chart see incomplete data all day.
+
+    Throttled to once per minute (the scanner runs every 30s) — gaps don't
+    appear that fast.
+    """
+    global _last_tick_backfill_run
+    if not _is_market_hours():
+        return
+    import time as _t
+    now = _t.time()
+    if now - _last_tick_backfill_run < _TICK_BACKFILL_MIN_INTERVAL:
+        return
+
+    try:
+        gaps = _detect_tick_gaps_today()
+        if not gaps:
+            _last_tick_backfill_run = now
+            return
+
+        from data.truedata_adapter import TrueDataAdapter
+        from sqlalchemy import text
+        from database.db import engine as _engine
+
+        td_bf = TrueDataAdapter()
+        if not td_bf.authenticate():
+            return
+
+        # Pad each gap by 30s on both sides so the REST window overlaps
+        # with whatever the websocket gave us — the DELETE+INSERT is
+        # bounded so this is safe and idempotent.
+        total_inserted = 0
+        for from_dt, to_dt in gaps:
+            from_dt_pad = from_dt - timedelta(seconds=30)
+            to_dt_pad = to_dt + timedelta(seconds=30)
+            logger.info(
+                f"Tick backfill: filling gap "
+                f"{from_dt.strftime('%H:%M:%S')} → {to_dt.strftime('%H:%M:%S')} "
+                f"({(to_dt - from_dt).total_seconds():.0f}s)"
+            )
+            try:
+                ticks = td_bf.fetch_historical_ticks("NIFTY-I", start=from_dt_pad, end=to_dt_pad)
+            except Exception as e:
+                logger.warning(f"Tick backfill REST failed for gap: {e}")
+                continue
+            if ticks.empty:
+                continue
+
+            ticks = ticks.copy()
+            ticks["symbol"] = "NIFTY-I"
+            required = ["timestamp", "symbol", "price", "volume", "oi",
+                        "bid_price", "ask_price", "bid_qty", "ask_qty"]
+            for col in required:
+                if col not in ticks.columns:
+                    ticks[col] = ticks.get("price", 0) if col in ("bid_price", "ask_price") else 0
+            ticks = ticks[required]
+            ticks["timestamp"] = pd.to_datetime(ticks["timestamp"])
+
+            with _engine.begin() as conn:
+                conn.execute(
+                    text("DELETE FROM tick_data "
+                         "WHERE symbol = 'NIFTY-I' "
+                         "AND timestamp >= :from_ts AND timestamp <= :to_ts"),
+                    {"from_ts": from_dt_pad, "to_ts": to_dt_pad},
+                )
+                ticks.to_sql("tick_data", conn, if_exists="append", index=False,
+                             method=None, chunksize=2000)
+            total_inserted += len(ticks)
+            # Respect TrueData REST rate limit (1 req/sec)
+            _t.sleep(1.1)
+
+        _last_tick_backfill_run = now
+        if total_inserted:
+            logger.info(f"Tick backfill: inserted {total_inserted} NIFTY-I ticks across {len(gaps)} gap(s).")
+    except Exception as e:
+        logger.warning(f"Tick backfill failed: {e}")
 
 
 def _backfill_candles_if_stale():
@@ -536,6 +779,7 @@ def scan_market():
 
         # Auto-backfill if DB is stale during market hours
         _backfill_candles_if_stale()
+        _backfill_ticks_if_stale()
 
         # Load latest 300 candles
         df = read_sql(
@@ -555,6 +799,27 @@ def scan_market():
             return
 
         latest = featured.iloc[-1].to_dict()
+
+        # ── Compute live micro features from last ~120s of NIFTY-I ticks ──────
+        # Used as a 30% blend with the macro model in directional scoring below.
+        # Falls back to None if bid/ask coverage is too thin (we don't force a
+        # stale value into the model).
+        micro_latest = None
+        try:
+            tick_df = read_sql(
+                "SELECT timestamp, symbol, price, volume, bid_price, ask_price, "
+                "bid_qty, ask_qty FROM tick_data WHERE symbol = 'NIFTY-I' "
+                "AND bid_price > 0 AND ask_price > 0 "
+                "ORDER BY timestamp DESC LIMIT 200"
+            )
+            if not tick_df.empty and len(tick_df) >= 30:
+                tick_df = tick_df.sort_values("timestamp").reset_index(drop=True)
+                from features.micro_features import compute_micro_features
+                micro_df = compute_micro_features(tick_df, window_seconds=30)
+                if not micro_df.empty:
+                    micro_latest = micro_df.iloc[-1].to_dict()
+        except Exception as e:
+            logger.debug(f"micro feature compute skipped: {e}")
         state["last_price"] = float(latest.get("close", 0))
         state["last_scan"] = datetime.now().strftime("%H:%M:%S")
         state["scan_count"] += 1
@@ -582,6 +847,12 @@ def scan_market():
                 p = predictor.predict_macro(latest)
                 if p is not None:
                     ml_prob = p
+                # Blend in micro model when fresh tick microstructure is available
+                # (70% macro / 30% micro). Macro alone if micro is unavailable.
+                if micro_latest is not None:
+                    mp = predictor.predict_micro(micro_latest)
+                    if mp is not None:
+                        ml_prob = 0.7 * ml_prob + 0.3 * mp
 
             strat_prob = strategy_predictor.predict(sig.strategy, latest) or 0.5
             # Strategy model outputs 0.003–0.11 due to 97% negative class imbalance.
@@ -617,21 +888,15 @@ def scan_market():
                 + regime_bonus
             )
 
-            # Regime-specific threshold: SIDEWAYS markets produce naturally lower scores
-            # (ML less directional, no strong momentum). Trending markets stay at full threshold.
-            from strategy.regime_detector import MarketRegime
-            if regime in (MarketRegime.SIDEWAYS, MarketRegime.LOW_VOLATILITY):
-                effective_threshold = SCORE_THRESHOLD * 0.85  # ~0.51 when base is 0.60
-            elif regime in (MarketRegime.HIGH_VOLATILITY,):
-                effective_threshold = SCORE_THRESHOLD * 0.90  # ~0.54 — slightly easier in high vol
-            else:
-                effective_threshold = SCORE_THRESHOLD  # TRENDING_BULL / TRENDING_BEAR: full 0.60
-
-            # Unified quality gate: both CALL and PUT use put_score_threshold from MEDIUM profile
-            # (backtested: CALL WR 45% vs PUT 60% — CALLs need equal selectivity as PUTs)
+            # Quality floor raised 2026-04-08 from 0.70 → 0.75 after backtest analysis:
+            #   0.70-0.75 bucket: 25 trades, 28% WR, -₹3,551 (drag on P&L)
+            #   0.75-0.80 bucket: 12 trades, 42% WR, +₹1,207
+            #   0.80+ bucket:     17 trades, 76% WR, +₹34,718
+            # The 0.70-0.75 range adds noise without edge — filter it out.
             from config.risk_profiles import get_risk_profile as _get_rp, RiskLevel as _RL
+            from strategy.regime_detector import MarketRegime
             _med_profile = _get_rp(_RL.MEDIUM)
-            effective_threshold = max(effective_threshold, _med_profile.put_score_threshold)
+            effective_threshold = max(0.75, SCORE_THRESHOLD, _med_profile.put_score_threshold)
 
             # Strategy-specific gates (evidence from backtest with real slippage)
             if sig.strategy == "mean_reversion":
@@ -644,13 +909,123 @@ def scan_market():
                     continue
                 effective_threshold = max(effective_threshold, 0.80)
             elif sig.strategy == "vwap_momentum_breakout":
-                # Only in bullish trending regimes (CALL breakout strategy)
+                # Tightened 2026-04-08: was firing on 2-3 bar micro-spikes that reverted
+                # immediately. Now requires sustained breakout (>=2 of last 3 bars green
+                # AND last close > 3-bar-ago close) plus 0.78 score floor.
                 if regime not in (MarketRegime.TRENDING_BULL, MarketRegime.LOW_VOLATILITY):
                     continue
-                effective_threshold = max(effective_threshold, 0.65)
+                if len(featured) >= 4:
+                    last3 = featured.iloc[-4:-1]
+                    sustained_up = bool(
+                        (last3["close"] > last3["open"]).sum() >= 2
+                        and last3["close"].iloc[-1] > last3["close"].iloc[0]
+                    )
+                    if not sustained_up:
+                        continue
+                effective_threshold = max(effective_threshold, 0.78)
 
             if final_score < effective_threshold:
                 continue
+
+            # ── Previous-bar direction confirmation (CONTINUATION ONLY) ──────
+            # Rejects trades where the previous 1-min bar moved counter to the
+            # signal direction. Only applied to CONTINUATION strategies
+            # (vwap_momentum_breakout); skipped for reversal strategies
+            # (bearish_momentum, mean_reversion) because a reversal signal
+            # *should* fire against the prior bar's direction.
+            #
+            # Backtest testing 2026-04-08: applying this gate to reversal
+            # strategies filtered 8 MEDIUM trades, net -₹13,872 of filtered
+            # profit. Making it strategy-aware restored ~₹10k of that.
+            CONTINUATION_STRATEGIES = {"vwap_momentum_breakout"}
+            if sig.strategy in CONTINUATION_STRATEGIES and len(featured) >= 2:
+                prev_bar = featured.iloc[-2]
+                prev_open = float(prev_bar.get("open", 0))
+                prev_close = float(prev_bar.get("close", 0))
+                if prev_open > 0:
+                    prev_move_pct = (prev_close - prev_open) / prev_open
+                    if sig.direction == "PUT" and prev_move_pct > 0.0010:
+                        logger.info(
+                            f"SKIP {sig.strategy} {sig.direction}: prev-bar bullish "
+                            f"({prev_move_pct*100:+.3f}%) — continuation-only filter"
+                        )
+                        continue
+                    if sig.direction == "CALL" and prev_move_pct < -0.0010:
+                        logger.info(
+                            f"SKIP {sig.strategy} {sig.direction}: prev-bar bearish "
+                            f"({prev_move_pct*100:+.3f}%) — continuation-only filter"
+                        )
+                        continue
+
+            # ── Micro-level entry confirmation (CONTINUATION ONLY) ──────────
+            # Same reasoning as the prev-bar gate above: reversal strategies
+            # fire against current momentum by design, so rejecting them for
+            # "momentum opposes direction" is self-defeating. Only apply to
+            # continuation strategies. Reversal strategies rely on the
+            # option-premium confirmation gate below instead.
+            if sig.strategy in CONTINUATION_STRATEGIES:
+                try:
+                    if micro_latest is not None:
+                        tick_mom = micro_latest.get("tick_momentum", 0)
+                        if tick_mom is not None and not np.isnan(tick_mom):
+                            MICRO_THRESHOLD = 0.1
+                            if sig.direction == "CALL" and tick_mom < -MICRO_THRESHOLD:
+                                logger.info(
+                                    f"SKIP {sig.strategy} CALL: tick_momentum {tick_mom:.3f} "
+                                    f"strongly selling — micro opposes entry"
+                                )
+                                continue
+                            if sig.direction == "PUT" and tick_mom > MICRO_THRESHOLD:
+                                logger.info(
+                                    f"SKIP {sig.strategy} PUT: tick_momentum {tick_mom:.3f} "
+                                    f"strongly buying — micro opposes entry"
+                                )
+                                continue
+                except Exception as _e:
+                    logger.debug(f"micro confirmation check skipped: {_e}")
+
+            # ── Option-premium confirmation gate (Fix D, 2026-04-08) ────────
+            # Look at the last 30 SECONDS of ticks for the SPECIFIC option
+            # contract we're about to buy. If its premium has been actively
+            # falling >0.8% in that window, reject — we'd be catching a
+            # falling knife.
+            #
+            # Strict time window (not tick count) — illiquid strikes with
+            # few ticks get skipped entirely (fail-open), which is the
+            # correct behavior since microstructure on thin books is noise.
+            #
+            # This catches today's ₹-7,031 live trade: 24000PE premium fell
+            # 233.9→232.7 in ~25 seconds before entry.
+            try:
+                now_ts = datetime.now()
+                window_start = now_ts - timedelta(seconds=30)
+                # Build the option symbol (same logic as below)
+                _atm_probe = round(latest.get("close", 0) / 50) * 50
+                _opt_type_probe = "CE" if sig.direction == "CALL" else "PE"
+                _exp_code_probe = expiry.strftime("%y%m%d") if expiry else "000000"
+                _opt_sym_probe = f"NIFTY{_exp_code_probe}{_atm_probe}{_opt_type_probe}"
+
+                prem_ticks = read_sql(
+                    "SELECT timestamp, price FROM tick_data "
+                    "WHERE symbol = :sym "
+                    "AND timestamp >= :start "
+                    "ORDER BY timestamp",
+                    {"sym": _opt_sym_probe, "start": window_start},
+                )
+                if not prem_ticks.empty and len(prem_ticks) >= 8:
+                    first_p = float(prem_ticks.iloc[0]["price"])
+                    last_p = float(prem_ticks.iloc[-1]["price"])
+                    if first_p > 0:
+                        slope_pct = (last_p - first_p) / first_p
+                        if slope_pct < -0.008:
+                            logger.info(
+                                f"SKIP {sig.strategy} {sig.direction}: "
+                                f"option premium falling {slope_pct*100:+.2f}% "
+                                f"in last 30s ({first_p:.2f}→{last_p:.2f}) — premium gate"
+                            )
+                            continue
+            except Exception as _prem_err:
+                logger.debug(f"option premium gate skipped: {_prem_err}")
 
             atm = round(latest.get("close", 0) / 50) * 50
             opt_type = "CE" if sig.direction == "CALL" else "PE"
@@ -777,6 +1152,17 @@ def scan_market():
                 f"ML={ml_prob:.2f} Strat={strat_prob:.2f} Score={final_score:.2f}"
             )
 
+            # Server-side audio alert when no browser tab is open (no SSE clients)
+            if _sse_client_count == 0:
+                try:
+                    import subprocess as _sp
+                    _sp.Popen(
+                        ["afplay", "/System/Library/Sounds/Glass.aiff"],
+                        stdout=_sp.DEVNULL, stderr=_sp.DEVNULL
+                    )
+                except Exception:
+                    pass
+
             # Auto-trade mode: enter the position automatically without waiting for manual action
             if auto_trade_enabled:
                 _auto_enter_position(trade, trade_mode="test")
@@ -829,7 +1215,8 @@ def _run_end_of_day():
     except Exception as e:
         logger.error(f"EOD backfill error: {e}")
 
-    # 2. Incremental model retrain
+    # 2. Incremental model retrain (macro + micro only — strategy models
+    # are deliberately skipped here, see incremental_train.py comment for why)
     try:
         retrain_script = str(project_root / "scripts" / "incremental_train.py")
         if os.path.exists(retrain_script):
@@ -844,6 +1231,25 @@ def _run_end_of_day():
                 logger.error(f"EOD: Retrain failed: {result.stderr[:500]}")
     except Exception as e:
         logger.error(f"EOD retrain error: {e}")
+
+    # 3. Outcome-based strategy model retrain (uses real backtest WIN/LOSS
+    # outcomes from backtest_results/trades_*.csv). Safe to run nightly even
+    # when there's no new data — the script's --min-samples threshold makes
+    # it a no-op for strategies with <15 samples.
+    try:
+        outcome_script = str(project_root / "scripts" / "train_outcome_models.py")
+        if os.path.exists(outcome_script):
+            logger.info("EOD: Running outcome-based strategy model retrain...")
+            result = sp.run(
+                [python_bin, outcome_script],
+                cwd=str(project_root), capture_output=True, text=True, timeout=180,
+            )
+            if result.returncode == 0:
+                logger.info("EOD: Outcome strategy retrain completed")
+            else:
+                logger.error(f"EOD: Outcome retrain failed: {result.stderr[:500]}")
+    except Exception as e:
+        logger.error(f"EOD outcome retrain error: {e}")
 
     logger.info("=== END-OF-DAY AUTOMATION COMPLETE ===")
 
@@ -1462,7 +1868,18 @@ def _tick_monitor_loop():
                         if len(journey) > 500:
                             journey.pop(0)
 
-                # --- Regime-aware SL tightening (every 30s per position) ---
+                # --- Regime-aware SL tightening + adverse-move early exit ---
+                # Tightened 2026-04-08 after the ₹-7,031 NIFTY26041324000PE trade:
+                # the old 0.3% threshold (~72pts on NIFTY=24000) triggered AT the
+                # moment of exit — too late to help. Now has three tiers:
+                #
+                #   Tier 1: NIFTY moved >0.10% against us → log warning, no action
+                #   Tier 2: NIFTY moved >0.20% against us → tighten SL to entry+2%
+                #           (locks a tiny profit if we had any; otherwise caps loss)
+                #   Tier 3: NIFTY moved >0.30% against us AND option is underwater
+                #           → HARD EXIT at live_price (don't wait for SL hit)
+                #
+                # Runs every 10s (down from 30s) so fast reversals get caught.
                 if live_price is not None and pos["status"] == "OPEN":
                     try:
                         last_check = datetime.fromisoformat(pos.get("last_regime_check", "2000-01-01"))
@@ -1473,23 +1890,48 @@ def _tick_monitor_loop():
                             if nifty_bid > 0 and pos.get("index_price", 0) > 0:
                                 nifty_move_pct = (nifty_bid - pos["index_price"]) / pos["index_price"]
                                 direction = pos["direction"]
-                                # Regime flip: NIFTY has moved >0.3% AGAINST position direction
-                                regime_flipped = (
-                                    (direction == "CALL" and nifty_move_pct < -0.003) or
-                                    (direction == "PUT"  and nifty_move_pct >  0.003)
-                                )
-                                if regime_flipped and live_price > pos["sl"]:
-                                    # Tighten SL to current bid × 0.97 (3% below current price)
-                                    # Only tighten, never loosen
-                                    tight_sl = round(live_price * 0.97, 2)
-                                    if tight_sl > pos["sl"]:
-                                        pos["sl"] = tight_sl
+                                # Sign adverse = move is AGAINST our direction (+ve for CALL
+                                # means bearish move, for PUT means bullish move)
+                                adverse = -nifty_move_pct if direction == "CALL" else nifty_move_pct
+                                entry_prem = pos.get("entry_premium", 0) or 0
+
+                                if adverse >= 0.0030 and entry_prem > 0 and live_price < entry_prem:
+                                    # Tier 3: HARD EXIT. NIFTY moved 0.3% against us and
+                                    # the option is already in loss. Don't wait for SL.
+                                    logger.warning(
+                                        f"REGIME EXIT {pos['symbol']}: NIFTY moved {nifty_move_pct:+.2%} "
+                                        f"against {direction}, option underwater "
+                                        f"(₹{live_price} < entry ₹{entry_prem}). Closing now."
+                                    )
+                                    pos["status"] = "CLOSED"
+                                    pos["exit_time"] = datetime.now().strftime("%H:%M:%S")
+                                    pos["exit_premium"] = live_price
+                                    pos["exit_reason"] = "REGIME_EXIT"
+                                    lot = pos.get("lot_size", 65)
+                                    pos["realised_pnl"] = round((live_price - entry_prem) * lot, 2)
+                                    pos["unrealised_pnl"] = 0.0
+                                    _persist_closed_trade(pos)
+                                elif adverse >= 0.0020 and live_price > pos["sl"]:
+                                    # Tier 2: Tighten SL toward entry+2%. Locks a tiny
+                                    # profit or caps loss at ~entry.
+                                    target_sl = round(entry_prem * 1.02, 2) if entry_prem > 0 else pos["sl"]
+                                    # Don't tighten above current live price (would insta-exit)
+                                    safe_sl = min(target_sl, round(live_price * 0.98, 2))
+                                    if safe_sl > pos["sl"]:
+                                        pos["sl"] = safe_sl
                                         logger.info(
-                                            f"REGIME TIGHTEN {pos['symbol']}: SL→₹{tight_sl} "
+                                            f"REGIME TIGHTEN {pos['symbol']}: SL→₹{safe_sl} "
                                             f"(NIFTY moved {nifty_move_pct:+.2%} against {direction})"
                                         )
-                    except Exception:
-                        pass
+                                elif adverse >= 0.0010:
+                                    # Tier 1: Just log. Don't touch SL yet — small adverse
+                                    # moves often mean-revert within a minute.
+                                    logger.info(
+                                        f"REGIME WATCH {pos['symbol']}: NIFTY moved {nifty_move_pct:+.2%} "
+                                        f"against {direction}, live=₹{live_price} sl=₹{pos['sl']}"
+                                    )
+                    except Exception as _e:
+                        logger.debug(f"regime check failed: {_e}")
 
         except Exception as e:
             logger.error(f"Tick monitor error: {e}")
@@ -1889,66 +2331,77 @@ def api_stream():
     The frontend opens a single EventSource connection instead of multiple HTTP polls.
     """
     from flask import Response
+    global _sse_client_count
 
     def generate():
-        while True:
-            try:
-                # Build payload — read tick cache first so last_price is real-time
-                cache = {}
-                tick_cache_age = None
+        global _sse_client_count
+        _sse_client_count += 1
+        try:
+            while True:
                 try:
-                    mtime = os.path.getmtime(LIVE_CACHE_FILE)
-                    age = time.time() - mtime
-                    if age < 30:
-                        cache = json.loads(open(LIVE_CACHE_FILE).read())
-                        tick_cache_age = round(age, 1)
-                except Exception:
-                    pass
+                    # Build payload — read tick cache first so last_price is real-time
+                    cache = {}
+                    tick_cache_age = None
+                    try:
+                        mtime = os.path.getmtime(LIVE_CACHE_FILE)
+                        age = time.time() - mtime
+                        if age < 30:
+                            cache = json.loads(open(LIVE_CACHE_FILE).read())
+                            tick_cache_age = round(age, 1)
+                    except Exception:
+                        pass
 
-                # Use tick cache NIFTY-I price for real-time last_price (falls back to scanner value)
-                last_price = state.get("last_price", 0)
-                nifty_tick = cache.get("NIFTY-I", {})
-                if nifty_tick.get("price", 0):
-                    last_price = nifty_tick["price"]
+                    # Use tick cache NIFTY-I price for real-time last_price (falls back to scanner value)
+                    last_price = state.get("last_price", 0)
+                    nifty_tick = cache.get("NIFTY-I", {})
+                    if nifty_tick.get("price", 0):
+                        last_price = nifty_tick["price"]
 
-                payload = {
-                    "state": {
-                        "last_price": last_price,
-                        "regime": state.get("regime", "UNKNOWN"),
-                        "status": state.get("status", "idle"),
-                        "last_scan": state.get("last_scan"),
-                        "scan_count": state.get("scan_count", 0),
-                        "trade_suggestions": state.get("trade_suggestions", []),
-                        "auto_trade_enabled": state.get("auto_trade_enabled", True),
-                    },
-                    "positions_by_mode": paper_positions_by_mode,
-                    "tick_cache": cache,
-                    "tick_cache_age": tick_cache_age,
-                }
+                    # Spot price: NIFTY 50 index (excludes futures basis)
+                    spot_tick = cache.get("NIFTY 50", {})
+                    spot_price = spot_tick.get("price", 0) or 0
 
-                # Compute totals per mode
-                for m in ["test", "live"]:
-                    mpos = paper_positions_by_mode.get(m, [])
-                    o_pnl = sum(p["unrealised_pnl"] for p in mpos if p["status"] == "OPEN")
-                    c_pnl = sum(p.get("realised_pnl", 0) or 0 for p in mpos if p["status"] == "CLOSED")
-                    payload[f"total_open_pnl_{m}"] = round(o_pnl, 2)
-                    payload[f"total_closed_pnl_{m}"] = round(c_pnl, 2)
-                    payload[f"total_pnl_{m}"] = round(o_pnl + c_pnl, 2)
+                    payload = {
+                        "state": {
+                            "last_price": last_price,
+                            "spot_price": spot_price,
+                            "regime": state.get("regime", "UNKNOWN"),
+                            "status": state.get("status", "idle"),
+                            "last_scan": state.get("last_scan"),
+                            "scan_count": state.get("scan_count", 0),
+                            "trade_suggestions": state.get("trade_suggestions", []),
+                            "auto_trade_enabled": state.get("auto_trade_enabled", True),
+                        },
+                        "positions_by_mode": paper_positions_by_mode,
+                        "tick_cache": cache,
+                        "tick_cache_age": tick_cache_age,
+                    }
 
-                # Also include combined for backward compat
-                all_pos = paper_positions_by_mode.get("test", []) + paper_positions_by_mode.get("live", [])
-                open_pnl = sum(p["unrealised_pnl"] for p in all_pos if p["status"] == "OPEN")
-                closed_pnl = sum(p.get("realised_pnl", 0) or 0 for p in all_pos if p["status"] == "CLOSED")
-                payload["total_open_pnl"] = round(open_pnl, 2)
-                payload["total_closed_pnl"] = round(closed_pnl, 2)
-                payload["total_pnl"] = round(open_pnl + closed_pnl, 2)
+                    # Compute totals per mode
+                    for m in ["test", "live"]:
+                        mpos = paper_positions_by_mode.get(m, [])
+                        o_pnl = sum(p["unrealised_pnl"] for p in mpos if p["status"] == "OPEN")
+                        c_pnl = sum(p.get("realised_pnl", 0) or 0 for p in mpos if p["status"] == "CLOSED")
+                        payload[f"total_open_pnl_{m}"] = round(o_pnl, 2)
+                        payload[f"total_closed_pnl_{m}"] = round(c_pnl, 2)
+                        payload[f"total_pnl_{m}"] = round(o_pnl + c_pnl, 2)
 
-                yield f"data: {json.dumps(payload)}\n\n"
-            except GeneratorExit:
-                return
-            except Exception as e:
-                yield f"data: {json.dumps({'error': str(e)})}\n\n"
-            time.sleep(1)
+                    # Also include combined for backward compat
+                    all_pos = paper_positions_by_mode.get("test", []) + paper_positions_by_mode.get("live", [])
+                    open_pnl = sum(p["unrealised_pnl"] for p in all_pos if p["status"] == "OPEN")
+                    closed_pnl = sum(p.get("realised_pnl", 0) or 0 for p in all_pos if p["status"] == "CLOSED")
+                    payload["total_open_pnl"] = round(open_pnl, 2)
+                    payload["total_closed_pnl"] = round(closed_pnl, 2)
+                    payload["total_pnl"] = round(open_pnl + closed_pnl, 2)
+
+                    yield f"data: {json.dumps(payload)}\n\n"
+                except GeneratorExit:
+                    return
+                except Exception as e:
+                    yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                time.sleep(1)
+        finally:
+            _sse_client_count = max(0, _sse_client_count - 1)
 
     return Response(generate(), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})

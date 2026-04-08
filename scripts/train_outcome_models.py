@@ -165,7 +165,7 @@ def train_strategy_outcome_model(
     strategy_name: str,
     X: pd.DataFrame,
     y: pd.Series,
-    min_samples: int = 15,
+    min_samples: int = 10,
 ) -> dict | None:
     """Train a single strategy model on outcome-labeled features."""
     import xgboost as xgb
@@ -204,13 +204,15 @@ def train_strategy_outcome_model(
     )
 
     # Cross-val if enough samples
+    cv_auc = None
     if len(X) >= 30:
         n_splits = min(3, pos)  # can't have more splits than positives
         if n_splits >= 2:
             cv = StratifiedKFold(n_splits=n_splits, shuffle=False)
             try:
                 aucs = cross_val_score(model, X, y, cv=cv, scoring="roc_auc")
-                logger.info(f"    CV AUC: {aucs.round(3)} | avg={aucs.mean():.3f}")
+                cv_auc = float(aucs.mean())
+                logger.info(f"    CV AUC: {aucs.round(3)} | avg={cv_auc:.3f}")
             except Exception as e:
                 logger.warning(f"    CV failed: {e}")
 
@@ -224,9 +226,11 @@ def train_strategy_outcome_model(
 
     # Save
     path = STRATEGY_MODEL_DIR / f"{strategy_name}_model.pkl"
-    # Back up existing model
+    # Back up existing model. NB: don't `from datetime import datetime` inside
+    # the `if` block — Python sees the local rebinding and shadows the
+    # module-level import on line ~22, breaking the line below when path
+    # doesn't exist (cold start).
     if path.exists():
-        from datetime import datetime
         import shutil
         backup_dir = Path("models/saved/backups") / datetime.now().strftime("%Y%m%d")
         backup_dir.mkdir(parents=True, exist_ok=True)
@@ -239,6 +243,8 @@ def train_strategy_outcome_model(
         "n_samples": len(X),
         "n_wins": pos,
         "n_losses": neg,
+        "metrics": {"auc_roc": cv_auc, "win_rate": pos / len(X)},
+        "cv_auc": cv_auc,
         "trained_at": datetime.now().isoformat(),
         "training_method": "outcome_labels",
     }, path)
@@ -248,7 +254,11 @@ def train_strategy_outcome_model(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--min-samples", type=int, default=15)
+    parser.add_argument("--min-samples", type=int, default=10,
+                        help="Minimum samples per strategy to train (default 10). "
+                             "Lowered from 15 on 2026-04-08 to let data collection "
+                             "catch up faster — the >0.02 strat_prob gate is so loose "
+                             "that even a noisy 10-sample model is no worse than no model.")
     parser.add_argument("--evaluate", action="store_true", help="Show stats only, don't train")
     args = parser.parse_args()
 

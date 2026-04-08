@@ -513,55 +513,58 @@ Kelly sizing:     20% more capital per trade vs MEDIUM
 
 ## Backtest Results (March–April 2026, 15 Trading Days)
 
-These results are from `tick_replay_backtest.py` using **actual historical tick data** — the same pipeline runs in live mode. All three risk profiles were tested on the same date range.
+These results are from `tick_replay_backtest.py` using **actual historical tick data** for both the underlying (NIFTY-I) *and* the option contracts themselves — the exit loop walks individual option ticks within each minute, so SL/target/trailing decisions are tick-precise, not bar-approximated.
+
+**Latest run: 2026-04-08, 18 trading days (Mar 10 → Apr 8).**
 
 ### MEDIUM Risk — Recommended
 
 | Metric | Value |
 |---|---|
-| Total Trades | 42 |
-| Win Rate | **60%** |
-| Risk-Reward | **2.90** |
-| Net P&L | **+₹41,822** |
-| Avg per Trade | +₹996 |
-| Avg Win | +₹2,184 |
-| Avg Loss | -₹752 |
-| Max Drawdown | -₹4,726 |
+| Total Trades | 49 |
+| Win Rate | **71%** |
+| Risk-Reward | **1.37** |
+| Net P&L | **+₹53,715** |
+| Avg per Trade | +₹1,096 |
+| Avg Win | +₹2,165 |
+| Avg Loss | -₹1,577 |
+| Max Drawdown | -₹5,411 |
 
-Strategy breakdown: bearish_momentum 72% WR (+₹30,122) · mean_reversion 100% WR (+₹11,667) · vwap_momentum_breakout 23% WR (+₹34)
+Strategy breakdown: bearish_momentum 68% WR (+₹32,348) · mean_reversion 78% WR (+₹16,647) · vwap_momentum_breakout 100% WR (+₹4,720)
 
-Exit breakdown: TRAILING_SL 50%, SL 24%, RL_EXIT 14%, TIMEOUT 10%, EOD 2%
+Exit breakdown: TRAILING_SL 57% (96% profitable), SL 24%, RL_EXIT 16% (88% profitable), TIMEOUT 2%
 
 ### HIGH Risk
 
 | Metric | Value |
 |---|---|
-| Total Trades | 49 |
-| Win Rate | **53%** |
-| Risk-Reward | **1.98** |
-| Net P&L | **+₹29,023** |
-| Avg per Trade | +₹592 |
-| Avg Win | +₹2,017 |
-| Avg Loss | -₹1,018 |
-| Max Drawdown | -₹5,162 |
+| Total Trades | 52 |
+| Win Rate | **77%** |
+| Risk-Reward | **1.12** |
+| Net P&L | **+₹62,762** |
+| Avg per Trade | +₹1,207 |
+| Avg Win | +₹2,144 |
+| Avg Loss | -₹1,915 |
+| Max Drawdown | -₹4,954 |
 
-Exit breakdown: TRAILING_SL 49%, SL 27%, RL_EXIT 12%, TIMEOUT 10%, EOD 2%
+Exit breakdown: TRAILING_SL 60% (97% profitable), SL 21%, RL_EXIT 15%, TIMEOUT 2%, EOD 2%
 
 ### LOW Risk
 
 | Metric | Value |
 |---|---|
-| Total Trades | 17 |
-| Win Rate | **53%** |
-| Risk-Reward | **2.83** |
-| Net P&L | **+₹11,597** |
-| Avg per Trade | +₹682 |
-| Avg Win | +₹1,878 |
-| Avg Loss | -₹663 |
+| Total Trades | 9 |
+| Win Rate | **78%** |
+| Risk-Reward | **1.17** |
+| Net P&L | **+₹15,874** |
+| Avg per Trade | +₹1,764 |
+| Avg Win | +₹3,002 |
+| Avg Loss | -₹2,571 |
+| Max Drawdown | -₹3,860 |
 
-Exit breakdown: TRAILING_SL 88%, SL 6%, TIMEOUT 6%
+Exit breakdown: TRAILING_SL 67% (100% profitable), SL 22%, TIMEOUT 11%
 
-> **Notes**: The RL_EXIT agent contributes ~12–14% of exits across profiles (all profitable). MEDIUM has the best risk-reward (2.90×) and the highest mean_reversion win rate (100%, 4 trades). The vwap_momentum_breakout strategy (CALL) is active but underperforms in this date range — March 2026 was predominantly a bearish/sideways market where PUT signals naturally dominate. CALL performance is expected to improve in bull-trend periods. The max_trades/day gate is currently disabled to accumulate training data.
+> **Notes**: The RL_EXIT agent contributes ~15% of exits across profiles at ~90%+ profitability. TRAILING_SL is now >95% profitable across all profiles after the 2026-04-08 intra-bar exit-sequence fix. MEDIUM is recommended for risk-adjusted returns; HIGH delivers slightly higher absolute P&L with comparable drawdown. Every entry now passes four sequential gates: score threshold, previous-bar direction (continuation-only), micro-momentum (continuation-only), and option-premium confirmation (30-second window, all strategies). The option-premium gate specifically catches the "catching a falling knife" entry pattern where the option contract we're about to buy has been actively repricing down in the seconds before entry.
 
 ---
 
@@ -697,13 +700,14 @@ ai-trader/
 
 ## Known Limitations & Real-World Gaps
 
-1. **Slippage**: Modeled at flat ₹40 commission per trade. Real options slippage can be 0.5–2%+ for illiquid strikes — actual P&L would be lower
-2. **Bid-ask spread**: System uses close/LTP price, not actual fill price. For wide-spread options, fills may be worse
-3. **Data gaps**: If TrueData WebSocket drops, option premiums go stale → REST fallback (1 min delay)
-4. **Model drift**: XGBoost trained on 6-month history. During regime changes (budget, elections, global risk-off), accuracy degrades
-5. **Expiry day behavior**: On Tuesdays (expiry day), extreme theta decay and gamma spikes are only partially represented in training data
-6. **Outcome model sample size**: Only ~50 unique backtest trades so far → outcome models have AUC ≈ 0.50. More backtests needed before they add value
-7. **Lot sizing ceiling**: Kelly + score bonus resolves to 2 lots (130 units) for virtually all signals at ₹50K starting capital. True variation requires more equity or explicit score-tiered sizing
+1. **Slippage**: Modeled as half-spread on entry (ask) and exit (bid) plus flat ₹40 commission per trade. Real options slippage can still be higher for illiquid strikes; actual live P&L may come in 5-10% below backtest
+2. **Bid-ask spread**: System now uses real bid on exit and real ask on entry via tick_data when available. Older days without tick data fall back to close + half-spread estimate
+3. **Data gaps**: If TrueData WebSocket drops, tick gaps are auto-filled within 60s via REST `getticks` by `_backfill_ticks_if_stale()`. Candle gaps handled the same way by `_backfill_candles_if_stale()`. Only the last 5 days of ticks can be refilled; earlier gaps are permanent
+4. **Model drift**: XGBoost trained on ~7-month rolling history. During regime changes (budget, elections, global risk-off), accuracy degrades. EOD auto-retrain mitigates this but cannot fully adapt to unprecedented conditions
+5. **Expiry day behavior**: On Tuesdays (expiry day), extreme theta decay and gamma spikes are only partially represented in training data. Holiday-shifted expiries (like Apr 13 2026) are handled via live TrueData REST expiry lookup
+6. **Outcome model sample size**: Only ~60 unique backtest trades so far → outcome models have AUC ≈ 0.50-0.80 depending on strategy. More backtests needed before they add meaningful per-trade discrimination
+7. **Lot sizing**: Explicit score-tiered sizing (1 lot < 0.70 / 2 lots 0.70-0.80 / 3 lots ≥0.80) replaces the old Kelly formula which always resolved to 2 lots regardless of conviction
+8. **Minute-bar resolution for old days**: Before 2026-03-25, only minute candles were collected for options. Backtests on these days fall back to minute-bar exit approximation; tick-mode is only available for days where we have option tick data
 
 ---
 

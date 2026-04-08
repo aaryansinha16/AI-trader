@@ -1,11 +1,10 @@
 "use client";
 
-import React, { useEffect, useState, useCallback, useRef } from "react";
+import React, { useEffect, useState, useCallback } from "react";
 import Sidebar from "@/components/Sidebar";
-import TradeTable from "@/components/TradeTable";
 import PnlBarChart from "@/components/PnlBarChart";
 import { fetchJSON, type Trade, type LiveTrade, type JourneyPoint } from "@/lib/api";
-import { toDateStr, toISTTimeFull } from "@/lib/time";
+import { toDateStr, toISTTimeFull, toISTTime } from "@/lib/time";
 import { useTradingMode } from "@/contexts/TradingModeContext";
 import { Download, Activity } from "lucide-react";
 import { LineChart, Line, XAxis, YAxis, Tooltip, ReferenceLine, ResponsiveContainer, CartesianGrid } from "recharts";
@@ -16,13 +15,6 @@ type TabMode = "backtest" | "live";
 const riskColors: Record<string, string> = { low: "#4da6ff", medium: "#e8c300", high: "#00e87b" };
 const pnlFmt = (v: number) =>
   `₹${v >= 0 ? "+" : ""}${v.toLocaleString("en-IN", { maximumFractionDigits: 0 })}`;
-
-function resultVariant(r: string) {
-  if (r === "TARGET" || r === "TARGET_HIT") return "green";
-  if (r === "SL" || r === "TRAILING_SL" || r === "SL_HIT") return "red";
-  if (r === "RL_EXIT" || r === "DQN_EXIT") return "purple";
-  return "yellow";
-}
 
 // ── Journey chart (shared for both live and backtest trades) ─────────────────
 function JourneyChart({ journey, entryPremium, initialSl, target, symbol }: {
@@ -40,7 +32,7 @@ function JourneyChart({ journey, entryPremium, initialSl, target, symbol }: {
     ...pt,
     premium: pt.option_price ?? pt.premium ?? 0,
     // Format time label
-    time: pt.ts.length > 10 ? pt.ts.slice(11, 16) : `Bar ${i}`,
+    time: pt.ts.length > 10 ? toISTTime(pt.ts) : `Bar ${i}`,
     entry: entryPremium,
   }));
 
