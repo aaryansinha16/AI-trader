@@ -1,4 +1,4 @@
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5050";
+export const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5050";
 
 export const SSE_STREAM_URL = `${API_BASE}/api/stream`;
 
