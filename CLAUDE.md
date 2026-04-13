@@ -343,6 +343,11 @@ state = {
 
 ## What NOT To Do
 
+- **Don't subscribe to `NIFTY 50` (spot) in `collect_ticks.py`** — this was a 2026-04-08 bug that corrupted every macro feature. Spot and futures prices differ by ~50pt, and when both were stored under `symbol='NIFTY-I'` in `tick_data`, the resulting minute candles had fake ~40pt high-low ranges that poisoned RSI/ATR/Bollinger/MACD and silently destroyed the macro_model retrains. Only subscribe to `NIFTY-I` futures. The `on_tick()` handler has a defensive drop for any leaking spot symbol.
+- **Don't use `expiries[-1]` as a fallback in `get_nearest_expiry()`** — this was the 2026-04-08 bug that had the live collector subscribing to *yesterday's* expired contracts every morning. The only correct source for future expiries is TrueData REST `getSymbolExpiryList` (cached 1h). DB-derived expiries are only correct for historical backtests on past dates. `get_nearest_expiry()` now splits these two paths.
+- **Don't apply entry gates uniformly across strategies** — the 2026-04-08 first-pass fix broke MEDIUM from ₹+51k → ₹+37k because the previous-bar confirmation gate and micro-momentum gate were structurally wrong for reversal strategies (`bearish_momentum`, `mean_reversion`). A reversal signal *should* fire against recent momentum by design. Both gates now have a `CONTINUATION_STRATEGIES = {"vwap_momentum_breakout"}` check. If you add a new strategy, decide whether it's continuation or reversal before wiring gates.
+- **Don't use tick-COUNT windows for option-premium confirmation** — "last 10 ticks" can span 20 minutes on illiquid strikes and produce meaningless slopes. The Fix D gate uses a 30-SECOND time window and fails open if <8 ticks exist in that window.
+- **Don't check SL against `min(p_low_bid, self.sl)` after ratcheting SL within the same bar** — this was the 2026-04-08 trailing-stop giveback bug. Bars that spiked +30% then crashed to -5% activated trailing AND filled at -5% instead of at the trailing lock. Check SL against PRIOR sl, ratchet only after no exit, fill at `prior_sl` (not bar low).
 - **Don't use `incremental_train.py --days N` where N > 3** — safety guard rejects it; use `main.py train` for full retrains
 - **Don't retrain macro/micro models without a stable backtest baseline** — retraining changes XGBoost weights → different entry bars → RL_EXIT may stop firing → P&L collapses. Always restore from `backups/` if results degrade.
 - **Don't use `generate_macro_labels(threshold > 0.002, forward_periods > 20)`** — higher thresholds yield <5% positive rate → model outputs near-0 for all bars → directional_prob for PUT ≈ 1.0 constant → no signal filtering. Keep `threshold=0.001, forward_periods=15`.
@@ -388,10 +393,18 @@ MODEL_DIR=models/saved
 
 - **Market hours**: 9:15–15:30 IST weekdays. `_is_market_hours()` guards scanner and collector startup
 - **NIFTY lot size**: 65 units (1 lot = 65 shares)
-- **NIFTY weekly expiry**: Tuesdays (confirmed from symbol_master in DB)
+- **NIFTY weekly expiry**: Tuesdays by default, but individual weeks can be holiday-shifted (e.g. Apr 14 2026 → Apr 13 because Apr 14 is a national holiday). Never hard-code a weekday; always fetch from TrueData REST `getSymbolExpiryList`.
 - **ATM strike gap**: 50 points for NIFTY
 - **TickCollector buffer**: flushes to `tick_data` every 200 ticks
 - **Candle aggregation**: done by `collect_ticks.py` in-memory per minute, written via `upsert_candles()`
+- **Tick gap backfill**: `_backfill_ticks_if_stale()` runs every scan cycle during market hours, detects leading/internal/trailing gaps in today's `tick_data`, and fills them via TrueData REST `getticks`. Throttled to once per 60s.
 - **Model backups**: stored in `models/saved/backups/` with timestamp suffix before each retrain
 - **Logs**: `logs/tick_collector_YYYYMMDD.log` (one file per day), `logs/trading.log`
 - **Backtest results**: `backtest_results/*.json` and `*.csv`
+- **Backtest mode**: `scripts/tick_replay_backtest.py` uses tick-level option premium data via `load_option_premiums_for_day()`. The function detects tick availability and falls back to minute candles only when <50 ticks exist. Exit logic (SL/target/trailing) walks individual ticks within each minute when in tick mode.
+- **Entry gates** (in order, all in `backend/app.py:scan_market()` and `scripts/tick_replay_backtest.py`):
+    1. Score threshold (≥ 0.75, strategy-specific raises: mean_reversion 0.80, vwap 0.78)
+    2. Previous-bar direction confirmation — **continuation strategies only**
+    3. Micro-momentum confirmation (tick_momentum) — **continuation strategies only**
+    4. Option-premium confirmation (Fix D) — **all strategies**, 30s window, 0.8% drop threshold
+- **Intra-trade regime exit**: `_tick_monitor_loop` has three tiers — 0.10% adverse NIFTY move (log), 0.20% (tighten SL to entry+2%), 0.30% (HARD EXIT if option is underwater). Check interval 10s.

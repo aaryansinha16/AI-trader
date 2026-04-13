@@ -2941,8 +2941,105 @@ def api_option_ticks():
     return jsonify({"data": df.to_dict(orient="records"), "source": source})
 
 
+# ── Broker Execution API ────────────────────────────────────────────────────
+
+from broker.order_manager import OrderManager
+
+order_manager = OrderManager()
+
+
+@app.route("/api/broker/status")
+def api_broker_status():
+    """Return broker connection state, positions, daily P&L."""
+    return jsonify(order_manager.to_dict())
+
+
+@app.route("/api/broker/connect", methods=["POST"])
+def api_broker_connect():
+    """Authenticate with the configured broker."""
+    ok = order_manager.connect()
+    return jsonify({"connected": ok, "broker": order_manager.adapter.broker_name})
+
+
+@app.route("/api/broker/auth/login_url")
+def api_broker_login_url():
+    """Get the OAuth login URL for Zerodha (step 1 of auth flow)."""
+    from broker.zerodha_adapter import ZerodhaAdapter
+    if isinstance(order_manager.adapter, ZerodhaAdapter):
+        url = order_manager.adapter.generate_login_url()
+        return jsonify({"login_url": url})
+    return jsonify({"login_url": "", "message": "Not using Zerodha adapter"})
+
+
+@app.route("/api/broker/auth/callback", methods=["POST"])
+def api_broker_auth_callback():
+    """Complete OAuth flow with request_token (step 3)."""
+    from broker.zerodha_adapter import ZerodhaAdapter
+    body = request.get_json(force=True) if request.is_json else {}
+    token = body.get("request_token", "")
+    if not token:
+        return jsonify({"error": "request_token required"}), 400
+    if isinstance(order_manager.adapter, ZerodhaAdapter):
+        ok = order_manager.adapter.complete_auth(token)
+        return jsonify({"authenticated": ok})
+    return jsonify({"error": "Not using Zerodha adapter"}), 400
+
+
+@app.route("/api/broker/kill", methods=["POST"])
+def api_broker_kill():
+    """EMERGENCY: Kill switch — close all positions, halt trading."""
+    result = order_manager.kill_switch()
+    return jsonify(result)
+
+
+@app.route("/api/broker/resume", methods=["POST"])
+def api_broker_resume():
+    """Resume trading after a halt."""
+    result = order_manager.resume()
+    return jsonify(result)
+
+
+@app.route("/api/broker/reconcile")
+def api_broker_reconcile():
+    """Compare internal positions vs broker positions."""
+    return jsonify(order_manager.reconcile())
+
+
+@app.route("/api/broker/confirm", methods=["POST"])
+def api_broker_confirm_signal():
+    """Confirm a pending signal (manual confirmation mode)."""
+    body = request.get_json(force=True) if request.is_json else {}
+    index = body.get("index", 0)
+    result = order_manager.confirm_signal(index)
+    return jsonify(result)
+
+
+@app.route("/api/broker/reject", methods=["POST"])
+def api_broker_reject_signal():
+    """Reject a pending signal (manual confirmation mode)."""
+    body = request.get_json(force=True) if request.is_json else {}
+    index = body.get("index", 0)
+    result = order_manager.reject_signal(index)
+    return jsonify(result)
+
+
+@app.route("/api/broker/exit", methods=["POST"])
+def api_broker_exit():
+    """Manually exit a specific position by order_id."""
+    body = request.get_json(force=True) if request.is_json else {}
+    order_id = body.get("order_id", "")
+    price = float(body.get("price", 0))
+    if not order_id:
+        return jsonify({"error": "order_id required"}), 400
+    result = order_manager.exit_position(order_id, price=price, reason="MANUAL_EXIT")
+    return jsonify(result)
+
+
 if __name__ == "__main__":
     initialize()
+
+    # Connect broker adapter (paper by default)
+    order_manager.connect()
 
     # Start background scanner
     scanner_thread = threading.Thread(target=background_scanner, daemon=True)
@@ -2955,11 +3052,15 @@ if __name__ == "__main__":
     _default_port = 5050
     port = int(os.environ.get("PORT") or _default_port)
 
+    trade_mode = os.getenv("TRADE_MODE", "paper")
     print("\n" + "=" * 50)
-    print("  AI Trader Paper Trading Dashboard")
-    print(f"  Flask API: http://localhost:{port}")
+    print("  AI Trader Dashboard")
+    print(f"  Mode:       {trade_mode.upper()}")
+    print(f"  Broker:     {order_manager.adapter.broker_name}")
+    print(f"  Flask API:  http://localhost:{port}")
     print("  Next.js UI: http://localhost:3000")
     print(f"  SSE Stream: http://localhost:{port}/api/stream")
+    print(f"  Kill switch: POST http://localhost:{port}/api/broker/kill")
     print("  Press Ctrl+C to stop")
     print("=" * 50 + "\n")
 

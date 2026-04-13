@@ -5,6 +5,7 @@ import Sidebar from "@/components/Sidebar";
 import Badge from "@/components/Badge";
 import {
   fetchJSON,
+  SSE_STREAM_URL,
   type Candle,
   type BacktestResults,
   type CandleDateInfo,
@@ -302,6 +303,76 @@ export default function ChartsPage() {
   const [loadingTicks, setLoadingTicks] = useState(false);
 
   const [results, setResults] = useState<BacktestResults>({});
+
+  // ── Live option-chain prices from SSE (today only) ────────────────────
+  // Overlays tick_cache prices onto the chain state every ~1s so the
+  // option chain table updates live without refresh. Only connects the
+  // EventSource when selectedDate === today.
+  // ── Live option chain updates (today only) ───────────────────────────
+  // Two separate mechanisms:
+  //   1. SSE stream → live LTP prices (every ~1s, zero cost — same stream
+  //      that the live page uses, just reads tick_cache from the payload)
+  //   2. Periodic fetchJSON → OI + volume (every 30s via /api/options/chain,
+  //      which is a single DB query — OI/vol don't change faster than that)
+
+  // 1. SSE for live prices
+  useEffect(() => {
+    const today = new Date().toISOString().slice(0, 10);
+    if (selectedDate !== today) return;
+
+    const es = new EventSource(SSE_STREAM_URL);
+    es.onmessage = (ev) => {
+      try {
+        const data = JSON.parse(ev.data);
+        const cache = data.tick_cache as Record<string, { price: number }> | undefined;
+        if (!cache) return;
+        setChain((prev) => {
+          if (prev.length === 0) return prev;
+          let changed = false;
+          const updated = prev.map((row) => {
+            const live = cache[row.symbol];
+            if (live && live.price > 0 && Math.abs(live.price - row.last_price) > 0.01) {
+              changed = true;
+              return { ...row, last_price: live.price };
+            }
+            return row;
+          });
+          return changed ? updated : prev;
+        });
+      } catch {}
+    };
+    return () => es.close();
+  }, [selectedDate]);
+
+  // 2. Periodic OI + volume refresh (every 30s)
+  useEffect(() => {
+    const today = new Date().toISOString().slice(0, 10);
+    if (selectedDate !== today || !selectedExpiry) return;
+
+    const refresh = () => {
+      fetchJSON<OptionChainRow[]>(`/api/options/chain?date=${selectedDate}&expiry=${selectedExpiry}`)
+        .then((rows) => {
+          const freshMap = new Map(rows.map(r => [r.symbol, r]));
+          setChain((prev) => {
+            if (prev.length === 0) return prev;
+            let changed = false;
+            const updated = prev.map((row) => {
+              const fresh = freshMap.get(row.symbol);
+              if (fresh && (fresh.volume !== row.volume || fresh.oi !== row.oi)) {
+                changed = true;
+                return { ...row, volume: fresh.volume, oi: fresh.oi };
+              }
+              return row;
+            });
+            return changed ? updated : prev;
+          });
+        })
+        .catch(() => {});
+    };
+
+    const interval = setInterval(refresh, 30_000);
+    return () => clearInterval(interval);
+  }, [selectedDate, selectedExpiry]);
 
   // Current date info for toggle visibility
   const currentDateInfo = dates.find(d => d.day === selectedDate);

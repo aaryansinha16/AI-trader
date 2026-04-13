@@ -6,7 +6,7 @@ import Badge from "@/components/Badge";
 import {
   fetchJSON, postJSON,
   enterPaperTrade, exitPaperTrade, getPaperPositions, clearClosedPositions, setAutoTrade,
-  SSE_STREAM_URL,
+  SSE_STREAM_URL, API_BASE,
   type LiveState, type TradeSuggestion, type PaperPosition, type StreamPayload,
 } from "@/lib/api";
 import { RefreshCw, Zap, TrendingUp, TrendingDown, X, Trash2, Radio, Bot, Hand, Activity } from "lucide-react";
@@ -35,6 +35,17 @@ export default function LivePage() {
   const [livePrices, setLivePrices] = useState<Record<string, { price: number; ts: string }>>({});
   const [sseConnected, setSseConnected] = useState(false);
   const esRef = useRef<EventSource | null>(null);
+
+  // Broker execution status
+  const [brokerStatus, setBrokerStatus] = useState<any>(null);
+  const fetchBrokerStatus = () => {
+    fetchJSON<any>("/api/broker/status").then(setBrokerStatus).catch(() => {});
+  };
+  useEffect(() => {
+    fetchBrokerStatus();
+    const iv = setInterval(fetchBrokerStatus, 10_000);
+    return () => clearInterval(iv);
+  }, []);
 
   // SSE connection — single stream replaces all HTTP polling
   useEffect(() => {
@@ -545,6 +556,97 @@ export default function LivePage() {
             </div>
           </div>
         )}
+
+        {/* Broker Execution Status */}
+        <div className="t-panel p-4 mt-4" style={{ borderColor: brokerStatus?.halted ? '#5c1a1a' : '#1a3a1a' }}>
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-[11px] font-semibold uppercase tracking-wider" style={{ color: '#5a6270' }}>
+              Broker Execution
+            </h3>
+            <div className="flex gap-2">
+              <button
+                onClick={() => fetch(`${API_BASE}/api/broker/kill`, { method: "POST" }).then(() => fetchBrokerStatus())}
+                className="px-3 py-1 text-[9px] font-bold uppercase tracking-wider"
+                style={{ background: '#5c1a1a', color: '#ff3e3e', border: '1px solid #ff3e3e' }}
+              >
+                KILL SWITCH
+              </button>
+              {brokerStatus?.halted && (
+                <button
+                  onClick={() => fetch(`${API_BASE}/api/broker/resume`, { method: "POST" }).then(() => fetchBrokerStatus())}
+                  className="px-3 py-1 text-[9px] font-bold uppercase tracking-wider"
+                  style={{ background: '#1a3a1a', color: '#00e87b', border: '1px solid #00e87b' }}
+                >
+                  RESUME
+                </button>
+              )}
+            </div>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <span className="t-badge" style={{
+              borderColor: brokerStatus?.connected ? '#1a5c3a' : '#5c1a1a',
+              color: brokerStatus?.connected ? '#00e87b' : '#ff3e3e',
+              background: brokerStatus?.connected ? '#0a2a18' : '#2a0a0a',
+            }}>
+              {brokerStatus?.broker ?? "?"} {brokerStatus?.connected ? "CONNECTED" : "DISCONNECTED"}
+            </span>
+            <span className="t-badge" style={{
+              borderColor: '#1a3a5c', color: '#4da6ff', background: '#0a1a2a',
+            }}>
+              MODE: {brokerStatus?.mode?.toUpperCase() ?? "PAPER"}
+            </span>
+            <span className="t-badge" style={{
+              borderColor: brokerStatus?.halted ? '#5c1a1a' : '#2a2a1a',
+              color: brokerStatus?.halted ? '#ff3e3e' : '#5a6270',
+              background: brokerStatus?.halted ? '#2a0a0a' : '#1a1a0a',
+            }}>
+              {brokerStatus?.halted ? `HALTED: ${brokerStatus.halt_reason}` : "ACTIVE"}
+            </span>
+            <span className="t-badge" style={{
+              borderColor: '#2a2a1a',
+              color: (brokerStatus?.daily_pnl ?? 0) >= 0 ? '#00e87b' : '#ff3e3e',
+              background: '#1a1a0a',
+            }}>
+              Broker P&L: ₹{(brokerStatus?.daily_pnl ?? 0).toLocaleString("en-IN")}
+            </span>
+            <span className="t-badge" style={{ borderColor: '#2a2a1a', color: '#5a6270', background: '#1a1a0a' }}>
+              Trades: {brokerStatus?.trade_count ?? 0} | Max Loss: ₹{brokerStatus?.max_daily_loss ?? 0}
+            </span>
+            <span className="t-badge" style={{ borderColor: '#2a2a1a', color: '#5a6270', background: '#1a1a0a' }}>
+              Confirm: {brokerStatus?.confirmation_mode?.toUpperCase() ?? "AUTO"}
+            </span>
+          </div>
+          {(brokerStatus?.pending_signals?.length ?? 0) > 0 && (
+            <div className="mt-3 p-2" style={{ background: '#1a1a0a', border: '1px solid #3a3a1a' }}>
+              <p className="text-[9px] uppercase tracking-wider mb-2" style={{ color: '#e8c300' }}>
+                Pending Signals ({brokerStatus!.pending_signals!.length})
+              </p>
+              {brokerStatus!.pending_signals!.map((sig: any, i: number) => (
+                <div key={i} className="flex items-center justify-between mb-1">
+                  <span className="text-[10px]" style={{ color: '#ccc' }}>
+                    {sig.symbol} {sig.direction} — {sig.strategy} (score {sig.final_score?.toFixed(2)})
+                  </span>
+                  <div className="flex gap-1">
+                    <button
+                      onClick={() => fetch(`${API_BASE}/api/broker/confirm`, { method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify({index: i}) }).then(() => fetchBrokerStatus())}
+                      className="px-2 py-0.5 text-[8px] font-bold"
+                      style={{ background: '#1a5c3a', color: '#00e87b', border: '1px solid #00e87b' }}
+                    >
+                      EXECUTE
+                    </button>
+                    <button
+                      onClick={() => fetch(`${API_BASE}/api/broker/reject`, { method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify({index: i}) }).then(() => fetchBrokerStatus())}
+                      className="px-2 py-0.5 text-[8px] font-bold"
+                      style={{ background: '#5c1a1a', color: '#ff3e3e', border: '1px solid #ff3e3e' }}
+                    >
+                      REJECT
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
 
         {/* Model status — collapsed at bottom */}
         <div className="t-panel p-4 mt-4">

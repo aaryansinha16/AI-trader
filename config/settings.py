@@ -144,6 +144,17 @@ WEIGHT_TECHNICAL_STRENGTH = 0.20
 # WEIGHT_STRATEGY_PROB = 0.25  # reserved — strat_prob is used as gate only until models improve
 STRAT_PROB_SCALE = 0.06             # normalize strat_prob raw output to [0,1] when needed
 
+# ── Broker Execution ─────────────────────────────────────────────────────────
+TRADE_MODE = os.getenv("TRADE_MODE", "paper")              # "paper" or "zerodha"
+ORDER_CONFIRMATION = os.getenv("ORDER_CONFIRMATION", "auto")  # "auto" or "manual"
+MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "-5000"))
+MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "1"))
+
+# Zerodha Kite Connect (only needed when TRADE_MODE=zerodha)
+ZERODHA_API_KEY = os.getenv("ZERODHA_API_KEY", "")
+ZERODHA_API_SECRET = os.getenv("ZERODHA_API_SECRET", "")
+ZERODHA_ACCESS_TOKEN = os.getenv("ZERODHA_ACCESS_TOKEN", "")
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
