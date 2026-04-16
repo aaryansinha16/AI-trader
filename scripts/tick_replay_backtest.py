@@ -340,6 +340,7 @@ class OpenTrade:
         self.target = entry_premium * (1 + tgt_pct)
         self.trailing_active = False
         self.peak_premium = entry_premium
+        self.peak_bar_idx = entry_bar_idx  # bar index when peak was last set (stagnation tracking)
         self.premium_history = [entry_premium]
         self.exit_time = None
         self.exit_premium = None
@@ -354,14 +355,26 @@ class OpenTrade:
             "bars_held": 0,
         }]
 
-    def _ratchet_trailing(self, new_peak_candidate: float, bars_held: int) -> None:
+    def _ratchet_trailing(self, new_peak_candidate: float, bars_held: int,
+                          current_bar_idx: int = None) -> None:
         """Update peak_premium and ratchet trailing SL upward. Pure side-effect.
 
         Called once per tick (tick mode) or once per bar (candle mode).
         Does NOT check for exits — the caller decides.
+
+        Retention logic (updated 2026-04-16):
+          1. Base tier from gain_pct (Option A — tiered for extreme profits)
+          2. Stagnation boost — if peak hasn't advanced in N bars AND we have
+             meaningful profit, bump retention up to lock more aggressively.
+             Rationale: options bleed theta each minute. If the trade isn't
+             advancing, it's losing to time decay. Trade-specific peak-staleness
+             counter resets every time a new peak is set.
         """
+        # Update peak and reset staleness counter when a new high is made
         if new_peak_candidate > self.peak_premium:
             self.peak_premium = new_peak_candidate
+            if current_bar_idx is not None:
+                self.peak_bar_idx = current_bar_idx
 
         if not self.trailing_active:
             gain_pct = (self.peak_premium - self.entry_premium) / self.entry_premium
@@ -372,12 +385,36 @@ class OpenTrade:
         else:
             gain_from_entry = self.peak_premium - self.entry_premium
             gain_pct = gain_from_entry / self.entry_premium if self.entry_premium > 0 else 0
-            if gain_pct >= TRAILING_TRIGGER * 2.5:
+
+            # ── Base retention: tiered by peak gain ──────────────────────
+            # New extreme-profit tiers added 2026-04-16 based on observed
+            # giveback pattern on +35% to +50% winners.
+            if gain_pct >= 0.50:                      # monster gain (>50%)
+                retention = 0.80
+            elif gain_pct >= 0.35:                    # big gain (35-50%)
+                retention = 0.70
+            elif gain_pct >= 0.25:                    # solid gain (25-35%)
+                retention = 0.60
+            elif gain_pct >= TRAILING_TRIGGER * 2.5:  # 20%+ (original top tier)
                 retention = 0.55
-            elif gain_pct >= TRAILING_TRIGGER * 1.5:
+            elif gain_pct >= TRAILING_TRIGGER * 1.5:  # 12%+
                 retention = 0.45
-            else:
+            else:                                     # 8-12%
                 retention = 0.35
+
+            # ── Stagnation boost: peak hasn't advanced ───────────────────
+            # Only apply when we have meaningful profit to protect (>=15%)
+            # and when we know the current bar_idx (tick-mode always has it;
+            # candle-mode passes it too now). Peak-staleness resets above.
+            if current_bar_idx is not None and gain_pct >= 0.15:
+                bars_since_peak = current_bar_idx - self.peak_bar_idx
+                if bars_since_peak >= 20:       # 20+ min flat → near-peak lock
+                    retention = min(0.90, retention + 0.20)
+                elif bars_since_peak >= 10:     # 10-20 min flat → tighten hard
+                    retention = min(0.85, retention + 0.12)
+                elif bars_since_peak >= 5:      # 5-10 min flat → gentle tighten
+                    retention = min(0.80, retention + 0.06)
+
             trail_sl = self.entry_premium + retention * gain_from_entry
             self.sl = max(self.sl, trail_sl)
 
@@ -471,7 +508,7 @@ class OpenTrade:
 
             # 3. No exit → ratchet trailing using THIS tick's mid price.
             # Tick-mode peak tracking is intra-minute precise.
-            self._ratchet_trailing(tick_price, bars_held)
+            self._ratchet_trailing(tick_price, bars_held, current_bar_idx=bar_idx)
 
         # Record journey point for this minute (one per minute, not per tick,
         # to keep journey JSON sizes manageable).
@@ -575,7 +612,7 @@ class OpenTrade:
 
         # If no hard exit, ratchet trailing for next bar using bar high
         if exit_prem is None:
-            self._ratchet_trailing(p_high, bars_held)
+            self._ratchet_trailing(p_high, bars_held, current_bar_idx=bar_idx)
 
         # RL agent override (only when no hard exit triggered)
         if exit_prem is None and self.rl_agent is not None and self.rl_agent.is_loaded:

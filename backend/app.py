@@ -116,6 +116,25 @@ def _persist_closed_trade(pos: dict):
     except Exception as e:
         logger.warning(f"Failed to persist trade {pos.get('id')}: {e}")
 
+    # ── Consecutive SL tracking (ported from backtest 2026-04-15) ────────
+    # Count consecutive SL_HIT exits. After 2 in a row, pause new entries
+    # for 30 minutes. Any non-SL exit (trailing, target, RL, timeout, manual)
+    # resets the counter.
+    global _consecutive_sl_hits, _sl_pause_until
+    reason = pos.get("exit_reason", "")
+    if reason == "SL_HIT":
+        _consecutive_sl_hits += 1
+        if _consecutive_sl_hits >= 2:
+            _sl_pause_until = datetime.now() + timedelta(minutes=30)
+            logger.warning(
+                f"SL COOLDOWN ACTIVATED: {_consecutive_sl_hits} consecutive SL hits — "
+                f"pausing entries until {_sl_pause_until.strftime('%H:%M')}"
+            )
+    else:
+        if _consecutive_sl_hits > 0:
+            logger.debug(f"SL streak broken ({reason}): counter reset")
+        _consecutive_sl_hits = 0
+
 
 def _get_mode_positions(mode: str = None) -> list:
     """Return positions list for given mode (from request arg or explicit)."""
@@ -518,6 +537,12 @@ TICK_STALENESS_THRESHOLD_SECS = 120
 _last_tick_backfill_run = 0.0
 _TICK_BACKFILL_MIN_INTERVAL = 60.0
 
+# Consecutive SL tracking (ported from backtest 2026-04-15). After 2
+# consecutive SL hits, pause new entries for 30 minutes. Resets on any
+# non-SL exit (trailing, target, RL, timeout).
+_consecutive_sl_hits: int = 0
+_sl_pause_until: datetime = datetime.min
+
 
 def _detect_tick_gaps_today(min_gap_secs: int = TICK_STALENESS_THRESHOLD_SECS) -> list:
     """
@@ -837,6 +862,35 @@ def scan_market():
         if not signals:
             return
 
+        # ── Time-of-day gate (added 2026-04-15, ported from backtest) ─────
+        # Backtest enforces these windows via SKIP_FIRST_MIN / SKIP_LAST_MIN /
+        # AFTERNOON_CUT from the active risk profile. Live was missing them
+        # entirely, letting afternoon entries slip through that backtest
+        # would have rejected. MEDIUM profile: afternoon_cut=210 = 12:45 IST.
+        from config.risk_profiles import get_risk_profile as _get_rp_t, RiskLevel as _RL_t
+        _prof = _get_rp_t(_RL_t.MEDIUM)
+        now_ist = datetime.now()
+        minutes_from_open = max(0, now_ist.hour * 60 + now_ist.minute - 555)  # 9:15 IST = 555 min
+        if minutes_from_open < _prof.skip_first_min:
+            return
+        if minutes_from_open > (375 - _prof.skip_last_min):
+            return
+        if minutes_from_open > _prof.afternoon_cut:
+            logger.info(
+                f"SKIP all signals: past afternoon_cut "
+                f"({minutes_from_open}min from open > {_prof.afternoon_cut}min)"
+            )
+            return
+
+        # ── Consecutive-SL cooldown (added 2026-04-15, ported from backtest) ─
+        # After 2 SL hits in a row, pause new entries for 30 minutes. Resets
+        # on any non-SL exit. Prevents the 4-SL-cluster pattern from today.
+        global _consecutive_sl_hits, _sl_pause_until
+        if datetime.now() < _sl_pause_until:
+            remaining = int((_sl_pause_until - datetime.now()).total_seconds() / 60)
+            logger.info(f"SKIP all signals: SL cooldown active ({remaining}min remaining)")
+            return
+
         today = date.today()
         expiry = get_nearest_expiry(today)
         dte = get_days_to_expiry(today, expiry) if expiry else 0
@@ -847,12 +901,18 @@ def scan_market():
                 p = predictor.predict_macro(latest)
                 if p is not None:
                     ml_prob = p
-                # Blend in micro model when fresh tick microstructure is available
-                # (70% macro / 30% micro). Macro alone if micro is unavailable.
-                if micro_latest is not None:
-                    mp = predictor.predict_micro(micro_latest)
-                    if mp is not None:
-                        ml_prob = 0.7 * ml_prob + 0.3 * mp
+                # Micro-model blend DISABLED 2026-04-15 after live-vs-backtest
+                # divergence investigation:
+                #   - Backtest uses macro-only ml_prob
+                #   - Live was blending 70% macro + 30% micro
+                #   - micro_model AUC = 0.50 (random) → adds NOISE, not signal
+                #   - On 2026-04-15 11:15 trade: macro=0.407 (score 0.74, reject)
+                #     but blended=0.358 (score 0.76, execute) — the 0.05 shift
+                #     across the 0.75 floor is pure noise firing trades the
+                #     backtest correctly rejects. Three consecutive losing days
+                #     (Apr 9/10/15) traced to this.
+                # The micro_model stays loaded but is no longer blended into
+                # directional scoring until its AUC > 0.55.
 
             strat_prob = strategy_predictor.predict(sig.strategy, latest) or 0.5
             # Strategy model outputs 0.003–0.11 due to 97% negative class imbalance.
@@ -1716,12 +1776,16 @@ def _update_position_price(pos: dict, live_prem: float):
         pos["breakeven_locked"] = False
     if "first_profit_time" not in pos:
         pos["first_profit_time"] = None
+    # Stagnation tracking: ISO timestamp of when max_premium was last set
+    if "peak_time" not in pos:
+        pos["peak_time"] = pos.get("entry_time_dt") or datetime.now().isoformat()
 
     now = datetime.now()
 
-    # Update max premium seen
+    # Update max premium seen + reset peak-staleness timer
     if live_prem > pos["max_premium"]:
         pos["max_premium"] = round(live_prem, 2)
+        pos["peak_time"] = now.isoformat()
 
     current_profit_pct = (live_prem - ep) / ep
 
@@ -1751,10 +1815,43 @@ def _update_position_price(pos: dict, live_prem: float):
     if profit_pct >= TRAIL_ACTIVATE_PCT:
         pos["trailing_active"] = True
 
-    # Compute trailing SL: entry + (max_profit * TRAIL_FACTOR)
+    # ── Tiered retention (unified with backtest 2026-04-16) ──────────────
+    # Base retention by peak gain + stagnation boost when peak stops advancing.
+    # Replaces the flat TRAIL_FACTOR=0.50 which was giving back too much
+    # profit on +35%+ winners.
     if pos["trailing_active"]:
         max_profit = pos["max_premium"] - ep
-        trail_sl = round(ep + max_profit * TRAIL_FACTOR, 2)
+        gain_pct = max_profit / ep if ep > 0 else 0
+
+        # Base tier
+        if gain_pct >= 0.50:                  # monster winner
+            retention = 0.80
+        elif gain_pct >= 0.35:                # big winner
+            retention = 0.70
+        elif gain_pct >= 0.25:                # solid winner
+            retention = 0.60
+        elif gain_pct >= 0.20:                # normal trail
+            retention = 0.55
+        elif gain_pct >= 0.12:
+            retention = 0.45
+        else:
+            retention = 0.35
+
+        # Stagnation boost — peak hasn't advanced in N minutes
+        if gain_pct >= 0.15:
+            try:
+                peak_dt = datetime.fromisoformat(pos["peak_time"])
+                mins_since_peak = (now - peak_dt).total_seconds() / 60
+                if mins_since_peak >= 20:
+                    retention = min(0.90, retention + 0.20)
+                elif mins_since_peak >= 10:
+                    retention = min(0.85, retention + 0.12)
+                elif mins_since_peak >= 5:
+                    retention = min(0.80, retention + 0.06)
+            except Exception:
+                pass
+
+        trail_sl = round(ep + max_profit * retention, 2)
         # SL can only move up, never down
         if trail_sl > pos["sl"]:
             pos["sl"] = trail_sl
