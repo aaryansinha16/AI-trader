@@ -83,6 +83,22 @@ def compute_price_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["ema20_50_cross"] = (df["ema20"] - df["ema50"]) / df["close"]
     df["close_above_sma200"] = (df["close"] > df["sma200"]).astype(int)
 
+    # ── Trend-context features (added 2026-04-19) ────────────────────────────
+    # Added after the Apr 17 ₹5k loss: bearish_momentum PUT fired during a clear
+    # up-trend pullback. These let the macro model learn "pullback in uptrend"
+    # explicitly instead of inferring it from ema20/ema50 raw values.
+    df["close_vs_ema50_pct"] = (df["close"] - df["ema50"]) / df["ema50"].replace(0, np.nan)
+    # "Weekly" slope on a 1-min chart ≈ 375 bars/day × 5 days = 1875 bars.
+    # A full week of history is rarely available intraday, so use 300 bars
+    # (~1 trading day) as a pragmatic multi-session trend slope.
+    df["weekly_trend_slope"] = df["close"].diff(300) / df["close"].shift(300).replace(0, np.nan)
+    # Pullback-in-uptrend: 1 when market is in an uptrend (close > ema50,
+    # ema20 > ema50) AND the last bar pulled back (close < open). This is the
+    # exact context where bearish_momentum PUT entries have historically lost.
+    uptrend = ((df["close"] > df["ema50"]) & (df["ema20"] > df["ema50"])).astype(int)
+    pullback = (df["close"] < df["open"]).astype(int)
+    df["pullback_in_uptrend"] = uptrend * pullback
+
     # ── VWAP ──────────────────────────────────────────────────────────────────
     had_dt_index = isinstance(df.index, pd.DatetimeIndex)
     if not had_dt_index and "timestamp" in df.columns:
