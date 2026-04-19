@@ -111,6 +111,8 @@ FEATURE_COLUMNS_MACRO = [
     "roc_10", "roc_20", "adx", "di_plus", "di_minus", "cci",
     # Trend crossovers
     "ema9_20_cross", "ema20_50_cross", "close_above_sma200",
+    # Trend context (added 2026-04-19)
+    "close_vs_ema50_pct", "weekly_trend_slope", "pullback_in_uptrend",
     # Volatility
     "atr_pct", "bollinger_pct", "returns_1m",
     "volatility_20", "volatility_60", "vol_regime",

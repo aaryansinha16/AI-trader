@@ -959,7 +959,25 @@ def scan_market():
             effective_threshold = max(0.75, SCORE_THRESHOLD, _med_profile.put_score_threshold)
 
             # Strategy-specific gates (evidence from backtest with real slippage)
-            if sig.strategy == "mean_reversion":
+            if sig.strategy == "bearish_momentum" and sig.direction == "PUT":
+                # Trend-context filter (added 2026-04-19 after Apr 17 ₹5k loss):
+                # bearish_momentum fires PUT signals on 1-bar red candles. In a
+                # confirmed uptrend (close > ema50 AND ema20 > ema50), these are
+                # pullbacks that almost always revert. Require much higher ML
+                # conviction (>=0.85) to take the trade in that context.
+                close_px = float(latest.get("close", 0) or 0)
+                ema20_v  = float(latest.get("ema20", 0) or 0)
+                ema50_v  = float(latest.get("ema50", 0) or 0)
+                in_uptrend = (close_px > 0 and ema50_v > 0
+                              and close_px > ema50_v and ema20_v > ema50_v)
+                if in_uptrend and directional_prob < 0.85:
+                    logger.info(
+                        f"SKIP bearish_momentum PUT: uptrend context "
+                        f"(close={close_px:.2f} ema20={ema20_v:.2f} ema50={ema50_v:.2f}) "
+                        f"and directional_prob={directional_prob:.3f} < 0.85"
+                    )
+                    continue
+            elif sig.strategy == "mean_reversion":
                 # Only fire in SIDEWAYS/LOW_VOLATILITY — in trending markets it fights the trend
                 # (scores 0.90-0.94 but still lost on trending days in backtest)
                 if regime not in (MarketRegime.SIDEWAYS, MarketRegime.LOW_VOLATILITY):
