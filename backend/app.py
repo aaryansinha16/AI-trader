@@ -960,7 +960,7 @@ def scan_market():
 
             # Strategy-specific gates (evidence from backtest with real slippage)
             if sig.strategy == "bearish_momentum" and sig.direction == "PUT":
-                # Trend-context filter (added 2026-04-19 after Apr 17 ₹5k loss):
+                # ── Gate A: trend-context filter (added 2026-04-19) ─────────
                 # bearish_momentum fires PUT signals on 1-bar red candles. In a
                 # confirmed uptrend (close > ema50 AND ema20 > ema50), these are
                 # pullbacks that almost always revert. Require much higher ML
@@ -975,6 +975,24 @@ def scan_market():
                         f"SKIP bearish_momentum PUT: uptrend context "
                         f"(close={close_px:.2f} ema20={ema20_v:.2f} ema50={ema50_v:.2f}) "
                         f"and directional_prob={directional_prob:.3f} < 0.85"
+                    )
+                    continue
+                # ── Gate B: multi-timeframe RSI divergence (added 2026-04-24)
+                # 4 of 5 live losses on Apr 22-23 entered with rsi<40 (1m
+                # oversold) while rsi_15m>85 (higher-TF extremely stretched
+                # to the upside). The Gate A check missed these because
+                # close had just ticked below ema50. An initial version
+                # used rsi_5m>60 as the higher-TF check but that also
+                # filtered too many real reversals (backtest regressed
+                # ₹81k→₹44k). rsi_15m>80 is a tighter "clearly stretched
+                # higher-TF" signal that still catches all 4 live losses.
+                rsi_1m  = float(latest.get("rsi") or 50.0)
+                rsi_15m = float(latest.get("rsi_15m") or 50.0)
+                if rsi_1m < 40.0 and rsi_15m > 80.0:
+                    logger.info(
+                        f"SKIP bearish_momentum PUT: multi-TF RSI divergence "
+                        f"(rsi_1m={rsi_1m:.1f}<40 rsi_15m={rsi_15m:.1f}>80) — "
+                        f"pullback-bottom inside stretched-up higher-TF"
                     )
                     continue
             elif sig.strategy == "mean_reversion":
