@@ -925,7 +925,7 @@ def replay_day(
 
             # Strategy-specific overrides (evidence-based from backtest with real slippage)
             if sig.strategy == "bearish_momentum" and sig.direction == "PUT":
-                # Trend-context filter (added 2026-04-19 after Apr 17 ₹5k loss):
+                # ── Gate A: trend-context filter (added 2026-04-19) ─────────
                 # bearish_momentum fires PUT on 1-bar red candles. In a confirmed
                 # uptrend (close > ema50 AND ema20 > ema50), these are pullbacks
                 # that almost always revert. Require directional_prob >= 0.85 to
@@ -941,6 +941,22 @@ def replay_day(
                             f"    SKIP  bearish_momentum PUT  uptrend context "
                             f"(close={close_px:.2f} ema20={ema20_v:.2f} ema50={ema50_v:.2f}) "
                             f"dir_prob={directional_prob:.3f} < 0.85"
+                        )
+                    continue
+                # ── Gate B: multi-timeframe RSI divergence (added 2026-04-24)
+                # 4 of 5 live Apr 22-23 losses entered with rsi<40 (1m
+                # oversold) while rsi_15m>85 (higher-TF extremely stretched
+                # up). Gate A misses these when close ticks just below
+                # ema50. Initial rsi_5m>60 threshold filtered too many real
+                # reversals; rsi_15m>80 is tight enough to catch only truly
+                # stretched up-days while sparing legitimate reversals.
+                rsi_1m  = float(latest.get("rsi") or 50.0)
+                rsi_15m = float(latest.get("rsi_15m") or 50.0)
+                if rsi_1m < 40.0 and rsi_15m > 80.0:
+                    if verbose:
+                        print(
+                            f"    SKIP  bearish_momentum PUT  multi-TF RSI divergence "
+                            f"(rsi_1m={rsi_1m:.1f}<40 rsi_15m={rsi_15m:.1f}>80)"
                         )
                     continue
             elif sig.strategy == "mean_reversion":
