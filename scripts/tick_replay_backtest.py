@@ -734,6 +734,12 @@ def replay_day(
     consecutive_sl_hits = 0
     sl_pause_until_bar = -1  # bar index after which trading resumes
 
+    # Same-(strategy, direction) ladder cooldown (added 2026-04-29). Apr 28
+    # live fired 5 bearish_momentum PUTs in 65min, 4 lost. Block subsequent
+    # entries of the same (strategy, direction) for 15 min after one fires.
+    STRATEGY_DIRECTION_COOLDOWN_BARS = 15  # 15 bars ≈ 15 min on 1m chart
+    last_entry_bar_by_strat_dir: dict[tuple[str, str], int] = {}
+
     # ── Stream minutes ───────────────────────────────────────────────────
     for bar_idx, minute_ts in enumerate(minutes):
         minute_ticks = minute_groups.get_group(minute_ts)
@@ -943,20 +949,18 @@ def replay_day(
                             f"dir_prob={directional_prob:.3f} < 0.85"
                         )
                     continue
-                # ── Gate B: multi-timeframe RSI divergence (added 2026-04-24)
-                # 4 of 5 live Apr 22-23 losses entered with rsi<40 (1m
-                # oversold) while rsi_15m>85 (higher-TF extremely stretched
-                # up). Gate A misses these when close ticks just below
-                # ema50. Initial rsi_5m>60 threshold filtered too many real
-                # reversals; rsi_15m>80 is tight enough to catch only truly
-                # stretched up-days while sparing legitimate reversals.
+                # ── Gate B: multi-timeframe RSI divergence (loosened 2026-04-29)
+                # Apr 28 added 2 near-misses with rsi_1m=40.9 and 44.1 that
+                # the strict <40 threshold missed. Loosened to <45 — entries
+                # against r15m>80 (clearly stretched higher-TF) are wrong
+                # whether r1m is 38 or 44.
                 rsi_1m  = float(latest.get("rsi") or 50.0)
                 rsi_15m = float(latest.get("rsi_15m") or 50.0)
-                if rsi_1m < 40.0 and rsi_15m > 80.0:
+                if rsi_1m < 45.0 and rsi_15m > 80.0:
                     if verbose:
                         print(
                             f"    SKIP  bearish_momentum PUT  multi-TF RSI divergence "
-                            f"(rsi_1m={rsi_1m:.1f}<40 rsi_15m={rsi_15m:.1f}>80)"
+                            f"(rsi_1m={rsi_1m:.1f}<45 rsi_15m={rsi_15m:.1f}>80)"
                         )
                     continue
             elif sig.strategy == "mean_reversion":
@@ -968,6 +972,24 @@ def replay_day(
                 # against the signal — counter-trend entries without ML backing have poor outcomes
                 if directional_prob < 0.40:
                     continue
+                # Trend-context gate for mean_reversion PUT (added 2026-04-29
+                # after Apr 29 PUT mean_rev MAE -₹3,433): same anti-pattern
+                # as bearish_momentum PUT in uptrend — fading the dominant
+                # trend when higher-TF is clearly stretched.
+                if sig.direction == "PUT":
+                    close_px_mr = float(latest.get("close", 0) or 0)
+                    ema20_mr    = float(latest.get("ema20", 0) or 0)
+                    ema50_mr    = float(latest.get("ema50", 0) or 0)
+                    rsi_15m_mr  = float(latest.get("rsi_15m") or 50.0)
+                    in_uptrend_mr = (close_px_mr > 0 and ema50_mr > 0
+                                     and close_px_mr > ema50_mr and ema20_mr > ema50_mr)
+                    if in_uptrend_mr and rsi_15m_mr > 70.0:
+                        if verbose:
+                            print(
+                                f"    SKIP  mean_reversion PUT  uptrend+stretched higher-TF "
+                                f"(close={close_px_mr:.2f} ema50={ema50_mr:.2f} rsi_15m={rsi_15m_mr:.1f}>70)"
+                            )
+                        continue
                 min_score = max(min_score, 0.80)
             elif sig.strategy == "vwap_momentum_breakout":
                 # Tightened 2026-04-08: was firing on 2-3 bar micro-spikes that reverted
@@ -999,6 +1021,17 @@ def replay_day(
                 continue
 
             signals_passed += 1
+
+            # ── Same-(strategy, direction) ladder cooldown (added 2026-04-29) ─
+            sd_key = (sig.strategy, sig.direction)
+            last_bar_sd = last_entry_bar_by_strat_dir.get(sd_key, -10**9)
+            if (bar_idx - last_bar_sd) < STRATEGY_DIRECTION_COOLDOWN_BARS:
+                if verbose:
+                    print(
+                        f"    SKIP  {sig.strategy} {sig.direction}  same-strat/dir cooldown "
+                        f"({bar_idx - last_bar_sd}/{STRATEGY_DIRECTION_COOLDOWN_BARS} bars since last)"
+                    )
+                continue
 
             # ── 9a. Previous-bar direction confirmation (CONTINUATION ONLY) ──
             # Reversal strategies (bearish_momentum, mean_reversion) inherently
@@ -1129,6 +1162,7 @@ def replay_day(
                 rl_agent=rl_agent,
             )
             daily_trades += 1
+            last_entry_bar_by_strat_dir[(sig.strategy, sig.direction)] = bar_idx
 
             if verbose:
                 print(

@@ -543,6 +543,13 @@ _TICK_BACKFILL_MIN_INTERVAL = 60.0
 _consecutive_sl_hits: int = 0
 _sl_pause_until: datetime = datetime.min
 
+# Per-(strategy, direction) entry cooldown to prevent ladder entries on the
+# same exhausted move. Apr 28 fired 5 bearish_momentum PUTs within 65 min,
+# 4 of 5 lost. Block subsequent entries of the same (strategy, direction)
+# for STRATEGY_DIRECTION_COOLDOWN_SECS after one fires, regardless of strike.
+STRATEGY_DIRECTION_COOLDOWN_SECS = 900  # 15 minutes
+_last_entry_by_strat_dir: dict[tuple[str, str], datetime] = {}
+
 
 def _detect_tick_gaps_today(min_gap_secs: int = TICK_STALENESS_THRESHOLD_SECS) -> list:
     """
@@ -977,21 +984,20 @@ def scan_market():
                         f"and directional_prob={directional_prob:.3f} < 0.85"
                     )
                     continue
-                # ── Gate B: multi-timeframe RSI divergence (added 2026-04-24)
-                # 4 of 5 live losses on Apr 22-23 entered with rsi<40 (1m
-                # oversold) while rsi_15m>85 (higher-TF extremely stretched
-                # to the upside). The Gate A check missed these because
-                # close had just ticked below ema50. An initial version
-                # used rsi_5m>60 as the higher-TF check but that also
-                # filtered too many real reversals (backtest regressed
-                # ₹81k→₹44k). rsi_15m>80 is a tighter "clearly stretched
-                # higher-TF" signal that still catches all 4 live losses.
+                # ── Gate B: multi-timeframe RSI divergence (added 2026-04-24,
+                # loosened 2026-04-29). Apr 22-23 live losses entered with
+                # rsi_1m<40 + rsi_15m>85. Apr 28 added 2 more near-misses
+                # (rsi_1m=40.9 and 44.1) that Gate B with strict <40 missed.
+                # Loosening to <45 catches those without filtering legitimate
+                # reversals — bearish_momentum PUT into a clearly stretched
+                # higher-TF (r15m>80) is the wrong setup whether r1m is 38
+                # or 44.
                 rsi_1m  = float(latest.get("rsi") or 50.0)
                 rsi_15m = float(latest.get("rsi_15m") or 50.0)
-                if rsi_1m < 40.0 and rsi_15m > 80.0:
+                if rsi_1m < 45.0 and rsi_15m > 80.0:
                     logger.info(
                         f"SKIP bearish_momentum PUT: multi-TF RSI divergence "
-                        f"(rsi_1m={rsi_1m:.1f}<40 rsi_15m={rsi_15m:.1f}>80) — "
+                        f"(rsi_1m={rsi_1m:.1f}<45 rsi_15m={rsi_15m:.1f}>80) — "
                         f"pullback-bottom inside stretched-up higher-TF"
                     )
                     continue
@@ -1003,6 +1009,24 @@ def scan_market():
                 # ML must confirm direction: directional_prob < 0.40 = model actively opposes signal
                 if directional_prob < 0.40:
                     continue
+                # Trend-context gate for mean_reversion PUT (added 2026-04-29
+                # after Apr 29 PUT mean_rev MAE -₹3,433 / final -₹60). PUT
+                # mean_reversion in an established uptrend with stretched
+                # higher-TF (r15m>70) is the same anti-pattern as bearish_
+                # momentum PUT in uptrend — fading the dominant trend.
+                if sig.direction == "PUT":
+                    close_px = float(latest.get("close", 0) or 0)
+                    ema20_v  = float(latest.get("ema20", 0) or 0)
+                    ema50_v  = float(latest.get("ema50", 0) or 0)
+                    rsi_15m  = float(latest.get("rsi_15m") or 50.0)
+                    in_uptrend = (close_px > 0 and ema50_v > 0
+                                  and close_px > ema50_v and ema20_v > ema50_v)
+                    if in_uptrend and rsi_15m > 70.0:
+                        logger.info(
+                            f"SKIP mean_reversion PUT: uptrend+stretched higher-TF "
+                            f"(close={close_px:.2f} ema50={ema50_v:.2f} rsi_15m={rsi_15m:.1f}>70)"
+                        )
+                        continue
                 effective_threshold = max(effective_threshold, 0.80)
             elif sig.strategy == "vwap_momentum_breakout":
                 # Tightened 2026-04-08: was firing on 2-3 bar micro-spikes that reverted
@@ -1022,6 +1046,25 @@ def scan_market():
 
             if final_score < effective_threshold:
                 continue
+
+            # ── Same-(strategy, direction) ladder cooldown (added 2026-04-29) ─
+            # Prevents firing multiple entries on the same exhausted move.
+            # Apr 28 fired 5 bearish_momentum PUTs in 65min, 4 lost. Apr 23
+            # fired 3 bearish_momentum PUTs in 8min, 2 lost. Block subsequent
+            # entries of the same (strategy, direction) for 15 min after one
+            # fires, regardless of strike.
+            sd_key = (sig.strategy, sig.direction)
+            last_sd = _last_entry_by_strat_dir.get(sd_key)
+            if last_sd is not None:
+                age = (datetime.now() - last_sd).total_seconds()
+                if age < STRATEGY_DIRECTION_COOLDOWN_SECS:
+                    remaining = int((STRATEGY_DIRECTION_COOLDOWN_SECS - age) / 60)
+                    logger.info(
+                        f"SKIP {sig.strategy} {sig.direction}: same-strat/dir cooldown "
+                        f"({remaining}min left, last fired {int(age/60)}min ago) — "
+                        f"avoid laddering"
+                    )
+                    continue
 
             # ── Previous-bar direction confirmation (CONTINUATION ONLY) ──────
             # Rejects trades where the previous 1-min bar moved counter to the
@@ -1242,6 +1285,9 @@ def scan_market():
             if len(state["trade_suggestions"]) > 50:
                 state["trade_suggestions"] = state["trade_suggestions"][-50:]
             state["trades_today"] += 1
+
+            # Record this fire for the same-(strategy, direction) ladder cooldown
+            _last_entry_by_strat_dir[(sig.strategy, sig.direction)] = datetime.now()
 
             logger.info(
                 f"TRADE SUGGESTION: {sig.direction} {opt_symbol} | "
