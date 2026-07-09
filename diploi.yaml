@@ -1,0 +1,55 @@
+# This file is used to build the infrastructure for a deployment.
+# After editing something here, apply the changes on the Diploi dashboard.
+# For more information, see https://diploi.com/yaml
+
+diploiVersion: v1.0
+components:
+  - hosts:
+      - port: 5050
+        endpoint: true
+        name: Backend API
+        identifier: app
+    name: Flask
+    identifier: flask
+    folder: /
+    package: https://github.com/diploi/component-flask#v3.1.3-05.2026
+    containerCommands:
+      productionStart: uv run --frozen gunicorn -w 4 -b 0.0.0.0:5050 backend.app:app
+      developmentStart: uv run flask --app backend/app.py run --host=0.0.0.0 --port=5050 --debug
+    env:
+      include:
+        - postgres.POSTGRES_HOST:DB_HOST
+        - postgres.POSTGRES_PORT:DB_PORT
+        - postgres.POSTGRES_USER:DB_USER
+        - postgres.POSTGRES_PASSWORD:DB_PASSWORD
+        - postgres.POSTGRES_DB:DB_NAME
+        - value: '3.12'
+          name: PYTHON_VERSION
+        - value: INFO
+          name: LOG_LEVEL
+        - value: paper
+          name: TRADE_MODE
+  - hosts:
+      - port: 3000
+        endpoint: true
+        name: Dashboard
+        identifier: app
+    name: Next.js
+    identifier: next
+    folder: /dashboard
+    package: https://github.com/diploi/component-nextjs#v16.2.5
+    containerCommands:
+      productionStart: node server.js
+      developmentStart: npm run dev
+    env:
+      include:
+        - postgres.*
+        - flask.APP_ENDPOINT:NEXT_PUBLIC_API_URL
+addons:
+  - name: PostgreSQL
+    identifier: postgres
+    package: https://github.com/diploi/addon-postgres#v18.3-url
+    env:
+      include:
+        - value: trading
+          name: POSTGRES_DB

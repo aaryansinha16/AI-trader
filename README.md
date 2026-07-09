@@ -306,6 +306,47 @@ MODEL_DIR=models/saved
 cd dashboard
 npm install
 ```
+---
+
+## Deployment
+
+### Deploy to Diploi
+
+[![Launch with Diploi](https://diploi.com/launch-big.svg)](https://diploi.com/launch/aaryansinha16/AI-trader)
+
+Click the button above to create a Diploi deployment from this repository.
+
+> **Note:** A successful deployment can show the basic dashboard UI, but live futures and options data requires paid market-data vendor credentials such as TrueData. Without those credentials, data-driven views and trading features will be limited.
+
+The included `diploi.yaml` provisions:
+
+- Flask backend API on port `5050`
+- Next.js dashboard on port `3000`
+- PostgreSQL database for trading data
+
+After the deployment is created, open the Diploi dashboard and add the required backend environment variables under the Flask component:
+
+```env
+TRUEDATA_USER=your_username
+TRUEDATA_PASSWORD=your_password
+INITIAL_CAPITAL=50000
+SCORE_THRESHOLD=0.6
+LOG_LEVEL=INFO
+MODEL_DIR=models/saved
+```
+
+Database variables are mapped automatically from the PostgreSQL addon in `diploi.yaml`.
+
+> **Deployment note:** After creating the Diploi deployment, manually increase the deployment disk size to at least `15GiB` in the Diploi dashboard.
+
+> **Database note:** On a fresh deployment, SSH into the Flask component and follow the database setup step using `uv`:
+> ```bash
+> uv run python -c "from database.db import init_db; init_db()"
+> ```
+
+Once the deployment finishes, open the Dashboard preview URL from Diploi. The dashboard is configured to call the Flask API through `NEXT_PUBLIC_API_URL`.
+
+For more information, see [diploi.com](https://diploi.com/).
 
 ---
 
